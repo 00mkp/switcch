@@ -49,12 +49,27 @@ func Prepare(a account.Account) (string, []string, error) {
 	}
 	if blob.IsExpired(time.Now()) {
 		if err := withRefreshLock(dir, func() error {
-			tr, err := refresh(context.Background(), blob.RefreshToken())
+			// Re-read inside the lock: another holder may have refreshed while we
+			// waited, and refreshing from the pre-lock (now-spent) token would
+			// double-spend the rotating refresh token and kill a healthy account.
+			fresh, err := readBackupCred(a.Slot)
 			if err != nil {
 				return err
 			}
-			blob.ApplyRefresh(tr.AccessToken, tr.RefreshToken, tr.ExpiresIn, tr.Scopes)
-			nb, err := blob.Marshal()
+			fb, err := credblob.Parse([]byte(fresh))
+			if err != nil {
+				return err
+			}
+			if !fb.IsExpired(time.Now()) {
+				cred = fresh // someone else already refreshed; use theirs
+				return nil
+			}
+			tr, err := refresh(context.Background(), fb.RefreshToken())
+			if err != nil {
+				return err
+			}
+			fb.ApplyRefresh(tr.AccessToken, tr.RefreshToken, tr.ExpiresIn, tr.Scopes)
+			nb, err := fb.Marshal()
 			if err != nil {
 				return err
 			}

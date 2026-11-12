@@ -72,6 +72,43 @@ func TestPrepareRefreshesExpiredAndBuildsEnv(t *testing.T) {
 	}
 }
 
+// If another holder refreshes the account while we wait for the refresh lock,
+// Prepare must re-read inside the lock and NOT refresh again with the now-spent
+// pre-lock token (which would double-spend and kill a healthy account).
+func TestPrepareReReadsInsideLockAvoidsDoubleSpend(t *testing.T) {
+	saveRestore(t)
+	acc := account.Account{Slot: 1, Email: "a@x.com"}
+	expired := `{"claudeAiOauth":{"accessToken":"OLD","refreshToken":"RT0","expiresAt":1}}`
+	fresh := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"NEW","refreshToken":"RT1","expiresAt":%d}}`, time.Now().Add(time.Hour).UnixMilli())
+	calls := 0
+	readBackupCred = func(slot int) (string, error) {
+		calls++
+		if calls == 1 {
+			return expired, nil // pre-lock read sees it expired
+		}
+		return fresh, nil // inside the lock another holder already refreshed it
+	}
+	writeBackupCred = func(slot int, cred string) error { return nil }
+	refreshCalls := 0
+	refresh = func(ctx context.Context, rt string) (oauth.TokenResponse, error) { refreshCalls++; return oauth.TokenResponse{}, nil }
+	withRefreshLock = func(dir string, fn func() error) error { return fn() }
+	var seeded string
+	seed = func(a account.Account, cred string) error { seeded = cred; return nil }
+	syncShared = func(p, h string) error { return nil }
+	profileDirFn = func(a account.Account) string { return "/tmp/p" }
+	defaultClaudeHome = func() string { return "/h/.claude" }
+
+	if _, _, err := Prepare(acc); err != nil {
+		t.Fatal(err)
+	}
+	if refreshCalls != 0 {
+		t.Fatalf("token was already refreshed by another holder; must not refresh again (calls=%d)", refreshCalls)
+	}
+	if !strings.Contains(seeded, "NEW") {
+		t.Fatalf("must seed the re-read fresh credential; seeded=%s", seeded)
+	}
+}
+
 func TestPrepareValidTokenSkipsRefresh(t *testing.T) {
 	saveRestore(t)
 	acc := account.Account{Slot: 1, Email: "a@x.com"}
