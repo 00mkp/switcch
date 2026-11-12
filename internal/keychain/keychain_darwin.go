@@ -46,19 +46,15 @@ func Write(service, value string) error {
 	acct := AccountName()
 	hexVal := hex.EncodeToString([]byte(value))
 	line := fmt.Sprintf("add-generic-password -U -a %q -s %q -X %s\n", acct, service, hexVal)
-	if len(line) <= 4096 {
-		cmd := exec.Command(securityBin, "-i")
-		cmd.Stdin = strings.NewReader(line)
-		var errb bytes.Buffer
-		cmd.Stderr = &errb
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("keychain: write %q failed: %v: %s", service, err, strings.TrimSpace(errb.String()))
-		}
-		return nil
+	// security's interactive line buffer caps at ~4096 bytes. We deliberately do
+	// NOT fall back to argv for larger payloads: a secret on argv is visible in
+	// ps. A single-account credential fits comfortably; if this is ever hit, the
+	// fix is the Security framework (SecItemAdd via cgo), not argv exposure.
+	if len(line) > 4096 {
+		return fmt.Errorf("keychain: write %q: payload too large for secure path (%d bytes); refusing to expose it on argv", service, len(line))
 	}
-	// Oversized payload: the interactive line buffer caps ~4096 bytes, so fall
-	// back to argv hex (payload is briefly visible in ps for large credentials).
-	cmd := exec.Command(securityBin, "add-generic-password", "-U", "-a", acct, "-s", service, "-X", hexVal)
+	cmd := exec.Command(securityBin, "-i")
+	cmd.Stdin = strings.NewReader(line)
 	var errb bytes.Buffer
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {

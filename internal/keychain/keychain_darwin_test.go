@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -41,5 +42,19 @@ func TestKeychainRoundTrip(t *testing.T) {
 	}
 	if _, err := Read(svc); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Read after Delete: err = %v, want ErrNotFound", err)
+	}
+}
+
+// A payload too large for the secure `security -i` stdin path must error, never
+// fall back to argv (which would expose the secret in ps).
+func TestWriteOversizedReturnsError(t *testing.T) {
+	svc := "switcch-test-" + randHex(t)
+	t.Cleanup(func() { _ = Delete(svc) })
+	big := strings.Repeat("x", 3000) // hex-encodes to ~6000 bytes, over the line limit
+	if err := Write(svc, big); err == nil {
+		t.Fatal("Write of oversized value should return an error, not store via argv")
+	}
+	if _, err := Read(svc); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("oversized Write must not store anything; Read err = %v, want ErrNotFound", err)
 	}
 }
