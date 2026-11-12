@@ -7,13 +7,13 @@ import (
 	"os"
 
 	"github.com/00mkp/switcch/internal/account"
-	"github.com/00mkp/switcch/internal/keychain"
+	"github.com/00mkp/switcch/internal/credfile"
 	"github.com/00mkp/switcch/internal/profile"
 )
 
 // Indirected for tests.
 var (
-	forgetDelCred   = func(slot int) error { return keychain.Delete(account.CredService(slot)) }
+	forgetDelCred   = credfile.Delete
 	forgetRmProfile = func(a account.Account) error { return os.RemoveAll(profile.Dir(a)) }
 )
 

@@ -90,7 +90,10 @@ func TestPrepareReReadsInsideLockAvoidsDoubleSpend(t *testing.T) {
 	}
 	writeBackupCred = func(slot int, cred string) error { return nil }
 	refreshCalls := 0
-	refresh = func(ctx context.Context, rt string) (oauth.TokenResponse, error) { refreshCalls++; return oauth.TokenResponse{}, nil }
+	refresh = func(ctx context.Context, rt string) (oauth.TokenResponse, error) {
+		refreshCalls++
+		return oauth.TokenResponse{}, nil
+	}
 	withRefreshLock = func(dir string, fn func() error) error { return fn() }
 	var seeded string
 	seed = func(a account.Account, cred string) error { seeded = cred; return nil }

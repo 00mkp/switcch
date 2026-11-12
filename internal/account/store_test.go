@@ -82,9 +82,3 @@ func TestRemove(t *testing.T) {
 		t.Fatalf("remove unknown: err = %v, want ErrNoAccount", err)
 	}
 }
-
-func TestCredServiceDistinctPerSlot(t *testing.T) {
-	if CredService(1) == CredService(2) {
-		t.Fatal("CredService must differ per slot")
-	}
-}

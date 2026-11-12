@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 
 	"github.com/00mkp/switcch/internal/account"
+	"github.com/00mkp/switcch/internal/credfile"
 	"github.com/00mkp/switcch/internal/keychain"
 )
 
@@ -23,7 +24,7 @@ var ErrNotLoggedIn = errors.New("capture: no logged-in Claude account found (run
 var (
 	readLiveCred     = func() (string, error) { return keychain.Read(keychain.ServiceName("")) }
 	readLiveIdentity = defaultReadLiveIdentity
-	writeBackupCred  = func(slot int, cred string) error { return keychain.Write(account.CredService(slot), cred) }
+	writeBackupCred  = credfile.Write
 )
 
 // Capture reads the live credential, derives the account identity, stores the

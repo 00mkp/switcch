@@ -14,15 +14,15 @@ import (
 
 	"github.com/00mkp/switcch/internal/account"
 	"github.com/00mkp/switcch/internal/credblob"
-	"github.com/00mkp/switcch/internal/keychain"
+	"github.com/00mkp/switcch/internal/credfile"
 	"github.com/00mkp/switcch/internal/oauth"
 	"github.com/00mkp/switcch/internal/profile"
 )
 
 // Indirected for tests.
 var (
-	readBackupCred    = func(slot int) (string, error) { return keychain.Read(account.CredService(slot)) }
-	writeBackupCred   = func(slot int, cred string) error { return keychain.Write(account.CredService(slot), cred) }
+	readBackupCred    = credfile.Read
+	writeBackupCred   = credfile.Write
 	refresh           = oauth.Refresh
 	withRefreshLock   = oauth.WithRefreshLock
 	seed              = profile.Seed
