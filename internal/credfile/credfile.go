@@ -1,13 +1,18 @@
-// Package credfile stores each account's backup credential as a 0600 file.
+// Package credfile stores each account's backup credential as an encrypted file.
 //
 // Real credentials include every MCP/connector OAuth token (mcpOAuth) and can be
-// ~20KB+, far past the macOS `security -i` ~4096-byte line limit, so the Keychain
-// CLI cannot write them without exposing the secret on argv. A 0600 file matches
-// the posture of the profile's seeded .credentials.json we already write; a cgo
-// Security-framework (SecItemAdd) store would be the encrypted-at-rest upgrade.
+// ~10-20KB, far past the macOS `security -i` ~4096-byte line limit, so the
+// Keychain CLI cannot write them without exposing the secret on argv. Instead the
+// credential is AES-256-GCM-encrypted into a 0600 file under a key held in the
+// Keychain (see key_darwin.go) — encrypted at rest, any size, no cgo. A legacy
+// plaintext file (pre-encryption) is migrated to ciphertext on first read.
 package credfile
 
 import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"os"
@@ -16,6 +21,12 @@ import (
 
 // ErrNotFound is returned by Read when no credential is stored for the slot.
 var ErrNotFound = errors.New("credfile: no stored credential")
+
+// loadKey returns the 32-byte AES key. The default has no platform key store;
+// a platform file (key_darwin.go) overrides it.
+var loadKey = func() ([]byte, error) {
+	return nil, errors.New("credfile: no key provider for this platform")
+}
 
 func dir() string {
 	base := os.Getenv("XDG_DATA_HOME")
@@ -31,25 +42,81 @@ func Path(slot int) string {
 	return filepath.Join(dir(), fmt.Sprintf("%d.json", slot))
 }
 
-// Read returns the stored credential for the slot, or ErrNotFound.
+func seal(key, plaintext []byte) ([]byte, error) {
+	gcm, err := newGCM(key)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	return gcm.Seal(nonce, nonce, plaintext, nil), nil
+}
+
+func open(key, data []byte) ([]byte, error) {
+	gcm, err := newGCM(key)
+	if err != nil {
+		return nil, err
+	}
+	ns := gcm.NonceSize()
+	if len(data) < ns {
+		return nil, errors.New("credfile: ciphertext too short")
+	}
+	return gcm.Open(nil, data[:ns], data[ns:], nil)
+}
+
+func newGCM(key []byte) (cipher.AEAD, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+// Read returns the decrypted credential for the slot, or ErrNotFound. A legacy
+// plaintext-JSON file is transparently re-encrypted in place and returned.
 func Read(slot int) (string, error) {
-	b, err := os.ReadFile(Path(slot))
+	raw, err := os.ReadFile(Path(slot))
 	if errors.Is(err, os.ErrNotExist) {
 		return "", ErrNotFound
 	}
 	if err != nil {
 		return "", err
 	}
-	return string(b), nil
+	key, err := loadKey()
+	if err != nil {
+		return "", err
+	}
+	pt, err := open(key, raw)
+	if err != nil {
+		// Migration: a pre-encryption file is plaintext JSON (starts with '{').
+		if bytes.HasPrefix(bytes.TrimSpace(raw), []byte("{")) {
+			if werr := Write(slot, string(raw)); werr != nil {
+				return "", fmt.Errorf("credfile: migrate slot %d: %w", slot, werr)
+			}
+			return string(raw), nil
+		}
+		return "", fmt.Errorf("credfile: decrypt slot %d: %w", slot, err)
+	}
+	return string(pt), nil
 }
 
-// Write stores cred for the slot atomically at mode 0600.
+// Write encrypts and stores cred for the slot atomically at mode 0600.
 func Write(slot int, cred string) error {
+	key, err := loadKey()
+	if err != nil {
+		return err
+	}
+	ct, err := seal(key, []byte(cred))
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(dir(), 0o700); err != nil {
 		return err
 	}
 	tmp := Path(slot) + ".tmp"
-	if err := os.WriteFile(tmp, []byte(cred), 0o600); err != nil {
+	if err := os.WriteFile(tmp, ct, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, Path(slot))

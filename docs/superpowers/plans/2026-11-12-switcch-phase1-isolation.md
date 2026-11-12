@@ -212,6 +212,23 @@ func TestKeychainRoundTrip(t *testing.T) {
 - [ ] **Step 4: Run** `go build ./... && go test ./...` → all pass.
 - [ ] **Step 5: Commit** — `feat(cli): switcch add/accounts/remove/<account> dispatch`.
 
+### Task 12: Encrypt the backup credential at rest (envelope encryption)
+
+**Files:**
+- Modify: `internal/credfile/credfile.go`
+- Create: `internal/credfile/key_darwin.go`
+- Test: `internal/credfile/credfile_test.go`, `internal/credfile/key_darwin_test.go`
+
+**Interfaces:**
+- `credfile.Read`/`Write`/`Delete`/`Path` signatures unchanged. Internally: `var loadKey func() ([]byte, error)` (default errors; darwin sets a keychain-backed provider). Write AES-256-GCM-encrypts (random 12-byte nonce prepended) to the `0600` file; Read decrypts, and transparently migrates a legacy plaintext-JSON file by re-encrypting it in place.
+- `key_darwin.go`: `var masterKeyService = "switcch-master-key"` (overridable in tests); get-or-create a 32-byte key via `keychain` (hex, via the stable `security` CLI → no per-rebuild prompt).
+
+- [ ] **Step 1: Write failing tests** — encrypted round-trip (incl. 25KB); file on disk does NOT contain the plaintext; tampered ciphertext fails to decrypt; legacy plaintext-JSON migrates on read; (darwin) `keychainLoadKey` is get-or-create stable across calls (throwaway service).
+- [ ] **Step 2: Run, verify fail.**
+- [ ] **Step 3: Implement** envelope encryption + migration + the darwin key provider.
+- [ ] **Step 4: Run, verify pass; whole suite green.**
+- [ ] **Step 5: Commit** — `feat(credfile): encrypt backup credential at rest (keychain-held AES key)`.
+
 ### Task 11: End-to-end verification (manual, real accounts)
 
 **Files:** none (manual smoke test; documented in `docs/superpowers/notes/phase1-smoke.md`).
