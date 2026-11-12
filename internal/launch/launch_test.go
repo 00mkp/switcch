@@ -79,7 +79,10 @@ func TestPrepareValidTokenSkipsRefresh(t *testing.T) {
 	readBackupCred = func(slot int) (string, error) { return valid, nil }
 	writeBackupCred = func(slot int, cred string) error { return nil }
 	refreshCalls := 0
-	refresh = func(ctx context.Context, rt string) (oauth.TokenResponse, error) { refreshCalls++; return oauth.TokenResponse{}, nil }
+	refresh = func(ctx context.Context, rt string) (oauth.TokenResponse, error) {
+		refreshCalls++
+		return oauth.TokenResponse{}, nil
+	}
 	withRefreshLock = func(dir string, fn func() error) error { return fn() }
 	seed = func(a account.Account, cred string) error { return nil }
 	syncShared = func(p, h string) error { return nil }
