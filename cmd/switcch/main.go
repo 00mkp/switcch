@@ -6,13 +6,24 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
 	"github.com/00mkp/switcch/internal/account"
 	"github.com/00mkp/switcch/internal/capture"
 	"github.com/00mkp/switcch/internal/launch"
+	"github.com/00mkp/switcch/internal/oauth"
 )
+
+// friendlyLaunchError turns a rotated/expired-credential failure into actionable
+// guidance; other errors pass through unchanged.
+func friendlyLaunchError(ref string, err error) error {
+	if errors.Is(err, oauth.ErrInvalidGrant) {
+		return fmt.Errorf("the stored credential for %q has expired or been rotated; re-register it with `switcch add` while logged in as that account", ref)
+	}
+	return err
+}
 
 type command struct {
 	kind       string // "add" | "list" | "remove" | "launch"
@@ -99,7 +110,7 @@ func run(args []string) error {
 		}
 		dir, env, err := launch.Prepare(a)
 		if err != nil {
-			return err
+			return friendlyLaunchError(cmd.ref, err)
 		}
 		return launch.Exec(dir, env, cmd.claudeArgs)
 	}

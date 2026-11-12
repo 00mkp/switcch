@@ -2,7 +2,29 @@
 
 package main
 
-import "testing"
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/00mkp/switcch/internal/oauth"
+)
+
+func TestFriendlyLaunchErrorInvalidGrant(t *testing.T) {
+	wrapped := fmt.Errorf("launch: refresh slot 2: %w", oauth.ErrInvalidGrant)
+	msg := friendlyLaunchError("work", wrapped).Error()
+	if !strings.Contains(msg, "switcch add") || !strings.Contains(msg, "work") {
+		t.Fatalf("message = %q, want it to mention `switcch add` and the account", msg)
+	}
+}
+
+func TestFriendlyLaunchErrorOther(t *testing.T) {
+	other := errors.New("boom")
+	if got := friendlyLaunchError("work", other); got != other {
+		t.Fatalf("non-invalid_grant error should pass through unchanged, got %v", got)
+	}
+}
 
 func TestRoute(t *testing.T) {
 	cases := []struct {
