@@ -9,6 +9,7 @@ import "fmt"
 type Account struct {
 	Slot        int    `json:"slot"`
 	Email       string `json:"email"`
+	AccountUUID string `json:"accountUuid,omitempty"`
 	OrgUUID     string `json:"orgUuid,omitempty"`
 	DisplayName string `json:"displayName,omitempty"`
 	OrgName     string `json:"orgName,omitempty"`
