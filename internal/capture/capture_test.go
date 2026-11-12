@@ -67,6 +67,39 @@ func TestCaptureRejectsEmptyIdentity(t *testing.T) {
 	}
 }
 
+func TestForgetDeletesCredAndProfile(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	store, _ := account.Load()
+	a, _ := store.Add(account.Account{Email: "a@x.com", Alias: "work"})
+
+	oc, orp := forgetDelCred, forgetRmProfile
+	t.Cleanup(func() { forgetDelCred, forgetRmProfile = oc, orp })
+	var delSlot int
+	rmCalled := false
+	forgetDelCred = func(slot int) error { delSlot = slot; return nil }
+	forgetRmProfile = func(account.Account) error { rmCalled = true; return nil }
+
+	got, err := Forget(store, "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Slot != a.Slot {
+		t.Fatalf("forgot %+v, want slot %d", got, a.Slot)
+	}
+	if delSlot != a.Slot {
+		t.Fatalf("deleted credential for slot %d, want %d", delSlot, a.Slot)
+	}
+	if !rmCalled {
+		t.Fatal("profile directory was not removed")
+	}
+	if len(store.List()) != 0 {
+		t.Fatal("account still present in registry after Forget")
+	}
+	if _, err := Forget(store, "nope"); err == nil {
+		t.Fatal("Forget of unknown ref should error")
+	}
+}
+
 func TestCaptureNotLoggedIn(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	store, _ := account.Load()

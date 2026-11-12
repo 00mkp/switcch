@@ -99,10 +99,15 @@ func run(args []string) error {
 		}
 		return nil
 	case "remove":
-		if err := store.Remove(cmd.ref); err != nil {
+		a, err := capture.Forget(store, cmd.ref)
+		if err != nil {
 			return err
 		}
-		return store.Save()
+		if err := store.Save(); err != nil {
+			return err
+		}
+		fmt.Printf("Removed account %d: %s\n", a.Slot, a.Email)
+		return nil
 	case "launch":
 		a, err := store.Resolve(cmd.ref)
 		if err != nil {
