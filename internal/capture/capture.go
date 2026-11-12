@@ -40,6 +40,9 @@ func Capture(store *account.Store, alias string) (account.Account, error) {
 	if err != nil {
 		return account.Account{}, fmt.Errorf("capture: read identity: %w", err)
 	}
+	if ident.Email == "" {
+		return account.Account{}, fmt.Errorf("capture: could not determine the account's email from ~/.claude.json; cannot register an unnamed account")
+	}
 	ident.Alias = alias
 	a, err := store.Add(ident)
 	if err != nil {

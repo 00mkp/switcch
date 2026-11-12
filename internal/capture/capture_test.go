@@ -47,6 +47,26 @@ func TestCaptureAddsAccountAndStoresCred(t *testing.T) {
 	}
 }
 
+func TestCaptureRejectsEmptyIdentity(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	store, _ := account.Load()
+	saveRestore(t)
+
+	readLiveCred = func() (string, error) { return `{"claudeAiOauth":{"accessToken":"AT"}}`, nil }
+	readLiveIdentity = func() (account.Account, error) { return account.Account{}, nil } // no email
+	writeBackupCred = func(slot int, cred string) error {
+		t.Fatal("must not store a credential for an empty identity")
+		return nil
+	}
+
+	if _, err := Capture(store, ""); err == nil {
+		t.Fatal("Capture should error when no account email can be determined")
+	}
+	if len(store.List()) != 0 {
+		t.Fatalf("must not register an empty-identity account; store has %d", len(store.List()))
+	}
+}
+
 func TestCaptureNotLoggedIn(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	store, _ := account.Load()
