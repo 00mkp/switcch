@@ -5,6 +5,7 @@ package launch
 import (
 	"context"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -12,7 +13,38 @@ import (
 
 	"github.com/00mkp/switcch/internal/account"
 	"github.com/00mkp/switcch/internal/oauth"
+	"github.com/00mkp/switcch/internal/session"
 )
+
+func TestPrepareRecordsSession(t *testing.T) {
+	saveRestore(t)
+	origRec := record
+	t.Cleanup(func() { record = origRec })
+
+	acc := account.Account{Slot: 3, Email: "a@x.com"}
+	valid := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"OK","refreshToken":"RT","expiresAt":%d}}`, time.Now().Add(time.Hour).UnixMilli())
+	readBackupCred = func(int) (string, error) { return valid, nil }
+	writeBackupCred = func(int, string) error { return nil }
+	refresh = func(context.Context, string) (oauth.TokenResponse, error) { return oauth.TokenResponse{}, nil }
+	withRefreshLock = func(string, func() error) error { return nil }
+	seed = func(account.Account, string) error { return nil }
+	syncShared = func(string, string) error { return nil }
+	profileDirFn = func(account.Account) string { return "/tmp/p" }
+	defaultClaudeHome = func() string { return "/h/.claude" }
+
+	var recorded session.Session
+	record = func(s session.Session) error { recorded = s; return nil }
+
+	if _, _, err := Prepare(acc); err != nil {
+		t.Fatal(err)
+	}
+	if recorded.Slot != 3 {
+		t.Fatalf("recorded slot = %d, want 3", recorded.Slot)
+	}
+	if recorded.PID != os.Getpid() {
+		t.Fatalf("recorded pid = %d, want current pid %d", recorded.PID, os.Getpid())
+	}
+}
 
 func saveRestore(t *testing.T) {
 	t.Helper()
