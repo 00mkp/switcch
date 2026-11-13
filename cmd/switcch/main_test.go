@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -13,6 +14,59 @@ import (
 	"github.com/00mkp/switcch/internal/session"
 	"github.com/00mkp/switcch/internal/usage"
 )
+
+func TestStatusJSON(t *testing.T) {
+	accts := []account.Account{{Slot: 1, Email: "a@x.com", Alias: "personal"}}
+	sessions := []session.Session{{Slot: 1, PID: 99, Cwd: "/p"}}
+	usageOf := func(account.Account) (usage.Usage, bool) {
+		return usage.Usage{
+			FiveHour: usage.Window{Utilization: 7},
+			SevenDay: usage.Window{Utilization: 11},
+			Models:   []usage.ModelCap{{Model: "Fable", Percent: 100, Active: true}},
+		}, true
+	}
+	b, err := statusJSON(accts, sessions, usageOf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed struct {
+		Accounts []struct {
+			Slot     int    `json:"slot"`
+			Email    string `json:"email"`
+			Alias    string `json:"alias"`
+			FiveHour struct {
+				Utilization float64 `json:"utilization"`
+			} `json:"fiveHour"`
+			Models []struct {
+				Model   string  `json:"model"`
+				Percent float64 `json:"percent"`
+			} `json:"models"`
+			Sessions []struct {
+				PID int    `json:"pid"`
+				Cwd string `json:"cwd"`
+			} `json:"sessions"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(b, &parsed); err != nil {
+		t.Fatalf("status json did not parse: %v\n%s", err, b)
+	}
+	if len(parsed.Accounts) != 1 {
+		t.Fatalf("accounts = %d", len(parsed.Accounts))
+	}
+	a := parsed.Accounts[0]
+	if a.Slot != 1 || a.Email != "a@x.com" || a.FiveHour.Utilization != 7 {
+		t.Fatalf("account = %+v", a)
+	}
+	if len(a.Models) != 1 || a.Models[0].Model != "Fable" {
+		t.Fatalf("models = %+v", a.Models)
+	}
+	if len(a.Sessions) != 1 || a.Sessions[0].PID != 99 {
+		t.Fatalf("sessions = %+v", a.Sessions)
+	}
+	if strings.Contains(string(b), "accessToken") || strings.Contains(string(b), "refreshToken") {
+		t.Fatal("status --json leaked a secret field")
+	}
+}
 
 func TestRenderList(t *testing.T) {
 	accts := []account.Account{
@@ -67,6 +121,7 @@ func TestRoute(t *testing.T) {
 		{args: []string{"accounts"}, kind: "accounts"},
 		{args: []string{"list"}, kind: "list"},
 		{args: []string{"remove", "work"}, kind: "remove", ref: "work"},
+		{args: []string{"status", "--json"}, kind: "status"},
 		{args: []string{"work"}, kind: "launch", ref: "work"},
 		{args: []string{}, wantErr: true},
 		{args: []string{"remove"}, wantErr: true}, // remove needs a ref

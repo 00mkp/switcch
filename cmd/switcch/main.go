@@ -7,10 +7,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/00mkp/switcch/internal/account"
 	"github.com/00mkp/switcch/internal/capture"
@@ -19,6 +21,62 @@ import (
 	"github.com/00mkp/switcch/internal/session"
 	"github.com/00mkp/switcch/internal/usage"
 )
+
+// statusJSON emits the machine-readable status (the interop seam): per-account
+// usage windows, model caps, and nested live sessions — and no secrets.
+func statusJSON(accts []account.Account, sessions []session.Session, usageOf func(account.Account) (usage.Usage, bool)) ([]byte, error) {
+	type jWindow struct {
+		Utilization float64    `json:"utilization"`
+		ResetsAt    *time.Time `json:"resetsAt,omitempty"`
+	}
+	type jModel struct {
+		Model   string  `json:"model"`
+		Percent float64 `json:"percent"`
+		Active  bool    `json:"active"`
+	}
+	type jSession struct {
+		PID     int       `json:"pid"`
+		Cwd     string    `json:"cwd"`
+		Started time.Time `json:"started"`
+	}
+	type jAccount struct {
+		Slot     int        `json:"slot"`
+		Email    string     `json:"email"`
+		Alias    string     `json:"alias,omitempty"`
+		FiveHour *jWindow   `json:"fiveHour,omitempty"`
+		SevenDay *jWindow   `json:"sevenDay,omitempty"`
+		Models   []jModel   `json:"models,omitempty"`
+		Sessions []jSession `json:"sessions"`
+	}
+	win := func(w usage.Window) *jWindow {
+		jw := &jWindow{Utilization: w.Utilization}
+		if w.HasReset {
+			t := w.ResetsAt
+			jw.ResetsAt = &t
+		}
+		return jw
+	}
+	out := struct {
+		Accounts []jAccount `json:"accounts"`
+	}{}
+	for _, a := range accts {
+		ja := jAccount{Slot: a.Slot, Email: a.Email, Alias: a.Alias, Sessions: []jSession{}}
+		if u, ok := usageOf(a); ok {
+			ja.FiveHour = win(u.FiveHour)
+			ja.SevenDay = win(u.SevenDay)
+			for _, m := range u.Models {
+				ja.Models = append(ja.Models, jModel{Model: m.Model, Percent: m.Percent, Active: m.Active})
+			}
+		}
+		for _, s := range sessions {
+			if s.Slot == a.Slot {
+				ja.Sessions = append(ja.Sessions, jSession{PID: s.PID, Cwd: s.Cwd, Started: s.Started})
+			}
+		}
+		out.Accounts = append(out.Accounts, ja)
+	}
+	return json.MarshalIndent(out, "", "  ")
+}
 
 // renderList builds the `cswap list`-style tree: each account with its usage and
 // its live sessions nested beneath. Pure, so it is testable without the network.
@@ -86,6 +144,8 @@ func route(args []string) (command, error) {
 			return command{}, fmt.Errorf("usage: switcch remove <account>")
 		}
 		return command{kind: "remove", ref: args[1]}, nil
+	case "status":
+		return command{kind: "status"}, nil
 	default:
 		return command{kind: "launch", ref: args[0], claudeArgs: args[1:]}, nil
 	}
@@ -153,6 +213,21 @@ func run(args []string) error {
 			return err
 		}
 		fmt.Printf("Removed account %d: %s\n", a.Slot, a.Email)
+		return nil
+	case "status":
+		accts := store.List()
+		sessions, _ := session.List()
+		b, err := statusJSON(accts, sessions, func(a account.Account) (usage.Usage, bool) {
+			u, _, err := usage.Cached(context.Background(), a)
+			if err != nil {
+				return usage.Usage{}, false
+			}
+			return u, true
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(b))
 		return nil
 	case "launch":
 		a, err := store.Resolve(cmd.ref)
