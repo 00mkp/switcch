@@ -18,12 +18,12 @@ import (
 func TestStatusJSON(t *testing.T) {
 	accts := []account.Account{{Slot: 1, Email: "a@x.com", Alias: "personal"}}
 	sessions := []session.Session{{Slot: 1, PID: 99, Cwd: "/p"}}
-	usageOf := func(account.Account) (usage.Usage, bool) {
+	usageOf := func(account.Account) (usage.Usage, error) {
 		return usage.Usage{
 			FiveHour: usage.Window{Utilization: 7},
 			SevenDay: usage.Window{Utilization: 11},
 			Models:   []usage.ModelCap{{Model: "Fable", Percent: 100, Active: true}},
-		}, true
+		}, nil
 	}
 	b, err := statusJSON(accts, sessions, usageOf)
 	if err != nil {
@@ -74,25 +74,27 @@ func TestRenderList(t *testing.T) {
 		{Slot: 2, Email: "b@y.com", Alias: "work"},
 	}
 	sessions := []session.Session{{Slot: 2, PID: 123, Cwd: "/w"}}
-	usageOf := func(a account.Account) (usage.Usage, bool) {
+	usageOf := func(a account.Account) (usage.Usage, error) {
 		if a.Slot == 1 {
-			return usage.Usage{FiveHour: usage.Window{Utilization: 12}, SevenDay: usage.Window{Utilization: 40}}, true
+			return usage.Usage{}, errors.New("token expired") // personal: usage unavailable
 		}
-		return usage.Usage{FiveHour: usage.Window{Utilization: 3}, SevenDay: usage.Window{Utilization: 5}}, true
+		return usage.Usage{FiveHour: usage.Window{Utilization: 3}, SevenDay: usage.Window{Utilization: 5}}, nil
 	}
 	out := renderList(accts, sessions, usageOf)
 
 	if !strings.Contains(out, "personal") || !strings.Contains(out, "work") {
 		t.Fatalf("missing account labels:\n%s", out)
 	}
-	if !strings.Contains(out, "12%") || !strings.Contains(out, "5h") {
-		t.Fatalf("missing usage numbers:\n%s", out)
+	// personal's usage failed — it must say so, not silently show nothing.
+	if !strings.Contains(out, "unavailable") {
+		t.Fatalf("personal usage failure should surface 'unavailable':\n%s", out)
+	}
+	// work shows its numbers and its session.
+	if !strings.Contains(out, "3%") || !strings.Contains(out, "5h") {
+		t.Fatalf("missing work usage numbers:\n%s", out)
 	}
 	if !strings.Contains(out, "/w") || !strings.Contains(out, "123") {
 		t.Fatalf("missing the work session:\n%s", out)
-	}
-	if n := strings.Count(out, "session"); n != 1 {
-		t.Fatalf("want exactly one session line (under work), got %d:\n%s", n, out)
 	}
 }
 

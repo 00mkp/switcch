@@ -24,7 +24,7 @@ import (
 
 // statusJSON emits the machine-readable status (the interop seam): per-account
 // usage windows, model caps, and nested live sessions — and no secrets.
-func statusJSON(accts []account.Account, sessions []session.Session, usageOf func(account.Account) (usage.Usage, bool)) ([]byte, error) {
+func statusJSON(accts []account.Account, sessions []session.Session, usageOf func(account.Account) (usage.Usage, error)) ([]byte, error) {
 	type jWindow struct {
 		Utilization float64    `json:"utilization"`
 		ResetsAt    *time.Time `json:"resetsAt,omitempty"`
@@ -40,13 +40,14 @@ func statusJSON(accts []account.Account, sessions []session.Session, usageOf fun
 		Started time.Time `json:"started"`
 	}
 	type jAccount struct {
-		Slot     int        `json:"slot"`
-		Email    string     `json:"email"`
-		Alias    string     `json:"alias,omitempty"`
-		FiveHour *jWindow   `json:"fiveHour,omitempty"`
-		SevenDay *jWindow   `json:"sevenDay,omitempty"`
-		Models   []jModel   `json:"models,omitempty"`
-		Sessions []jSession `json:"sessions"`
+		Slot       int        `json:"slot"`
+		Email      string     `json:"email"`
+		Alias      string     `json:"alias,omitempty"`
+		FiveHour   *jWindow   `json:"fiveHour,omitempty"`
+		SevenDay   *jWindow   `json:"sevenDay,omitempty"`
+		Models     []jModel   `json:"models,omitempty"`
+		UsageError string     `json:"usageError,omitempty"`
+		Sessions   []jSession `json:"sessions"`
 	}
 	win := func(w usage.Window) *jWindow {
 		jw := &jWindow{Utilization: w.Utilization}
@@ -61,12 +62,14 @@ func statusJSON(accts []account.Account, sessions []session.Session, usageOf fun
 	}{}
 	for _, a := range accts {
 		ja := jAccount{Slot: a.Slot, Email: a.Email, Alias: a.Alias, Sessions: []jSession{}}
-		if u, ok := usageOf(a); ok {
+		if u, err := usageOf(a); err == nil {
 			ja.FiveHour = win(u.FiveHour)
 			ja.SevenDay = win(u.SevenDay)
 			for _, m := range u.Models {
 				ja.Models = append(ja.Models, jModel{Model: m.Model, Percent: m.Percent, Active: m.Active})
 			}
+		} else {
+			ja.UsageError = shortErr(err)
 		}
 		for _, s := range sessions {
 			if s.Slot == a.Slot {
@@ -80,7 +83,7 @@ func statusJSON(accts []account.Account, sessions []session.Session, usageOf fun
 
 // renderList builds the `cswap list`-style tree: each account with its usage and
 // its live sessions nested beneath. Pure, so it is testable without the network.
-func renderList(accts []account.Account, sessions []session.Session, usageOf func(account.Account) (usage.Usage, bool)) string {
+func renderList(accts []account.Account, sessions []session.Session, usageOf func(account.Account) (usage.Usage, error)) string {
 	var b strings.Builder
 	for _, a := range accts {
 		label := a.Email
@@ -88,11 +91,15 @@ func renderList(accts []account.Account, sessions []session.Session, usageOf fun
 			label += " (" + a.Alias + ")"
 		}
 		fmt.Fprintf(&b, "%d: %s\n", a.Slot, label)
-		if u, ok := usageOf(a); ok {
+		if u, err := usageOf(a); err == nil {
 			fmt.Fprintf(&b, "   5h: %3.0f%%   7d: %3.0f%%\n", u.FiveHour.Utilization, u.SevenDay.Utilization)
 			for _, m := range u.Models {
-				fmt.Fprintf(&b, "   %s: %3.0f%%\n", m.Model, m.Percent)
+				if m.Active {
+					fmt.Fprintf(&b, "   %s: %3.0f%%\n", m.Model, m.Percent)
+				}
 			}
+		} else {
+			fmt.Fprintf(&b, "   usage unavailable (%s) — try `switcch add` to re-register\n", shortErr(err))
 		}
 		for _, s := range sessions {
 			if s.Slot == a.Slot {
@@ -101,6 +108,18 @@ func renderList(accts []account.Account, sessions []session.Session, usageOf fun
 		}
 	}
 	return b.String()
+}
+
+// shortErr trims a wrapped error to its most actionable tail.
+func shortErr(err error) string {
+	msg := err.Error()
+	if errors.Is(err, oauth.ErrInvalidGrant) {
+		return "credential expired/rotated"
+	}
+	if i := strings.LastIndex(msg, ": "); i >= 0 {
+		return msg[i+2:]
+	}
+	return msg
 }
 
 // friendlyLaunchError turns a rotated/expired-credential failure into actionable
@@ -216,12 +235,9 @@ func run(args []string) error {
 			return nil
 		}
 		sessions, _ := session.List()
-		fmt.Print(renderList(accts, sessions, func(a account.Account) (usage.Usage, bool) {
+		fmt.Print(renderList(accts, sessions, func(a account.Account) (usage.Usage, error) {
 			u, _, err := usage.Cached(context.Background(), a)
-			if err != nil {
-				return usage.Usage{}, false
-			}
-			return u, true
+			return u, err
 		}))
 		return nil
 	case "remove":
@@ -237,12 +253,9 @@ func run(args []string) error {
 	case "status":
 		accts := store.List()
 		sessions, _ := session.List()
-		b, err := statusJSON(accts, sessions, func(a account.Account) (usage.Usage, bool) {
+		b, err := statusJSON(accts, sessions, func(a account.Account) (usage.Usage, error) {
 			u, _, err := usage.Cached(context.Background(), a)
-			if err != nil {
-				return usage.Usage{}, false
-			}
-			return u, true
+			return u, err
 		})
 		if err != nil {
 			return err
