@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"github.com/00mkp/switcch/internal/credblob"
 	"github.com/00mkp/switcch/internal/credfile"
 	"github.com/00mkp/switcch/internal/oauth"
+	"github.com/00mkp/switcch/internal/profile"
 )
 
 // Test seams / tunables.
@@ -21,11 +24,16 @@ var (
 	fetch        = Fetch
 	tokenFor     = defaultTokenFor
 	forceRefresh = defaultForceRefresh
+	oauthRefresh = oauth.Refresh
+	// jitterFn spreads refetch times (0..20% of TTL) so accounts don't all
+	// refetch in lockstep. Zeroed in tests for determinism.
+	jitterFn = func() time.Duration { return time.Duration(rand.Int63n(int64(serveTTL / 5))) }
 )
 
 type entry struct {
-	Usage  Usage     `json:"usage"`
-	ReadAt time.Time `json:"readAt"`
+	Usage        Usage     `json:"usage"`
+	ReadAt       time.Time `json:"readAt"`
+	BlockedUntil time.Time `json:"blockedUntil,omitempty"`
 }
 
 func dataHome() string {
@@ -39,9 +47,10 @@ func dataHome() string {
 
 func cachePath() string { return filepath.Join(dataHome(), "usage-cache.json") }
 
-// Cached returns the account's usage, serving a cached reading younger than
-// serveTTL and otherwise fetching (coalesced under a file lock). A 401 triggers
-// one forced credential refresh + retry. Returns the usage and the time read.
+// Cached returns the account's usage: a cached reading younger than serveTTL
+// (plus jitter) is served; otherwise it fetches (coalesced under a file lock).
+// A 401 triggers one forced credential refresh + retry. On a 429/error it
+// records a backoff and serves the last good reading if there is one.
 func Cached(ctx context.Context, a account.Account) (Usage, time.Time, error) {
 	unlock, err := lock()
 	if err != nil {
@@ -50,8 +59,16 @@ func Cached(ctx context.Context, a account.Account) (Usage, time.Time, error) {
 	defer unlock()
 
 	cache := loadCache()
-	if e, ok := cache[a.Slot]; ok && nowFn().Sub(e.ReadAt) < serveTTL {
+	e, ok := cache[a.Slot]
+	now := nowFn()
+	if ok && !e.ReadAt.IsZero() && now.Sub(e.ReadAt) < serveTTL+jitterFn() {
 		return e.Usage, e.ReadAt, nil
+	}
+	if ok && now.Before(e.BlockedUntil) {
+		if !e.ReadAt.IsZero() {
+			return e.Usage, e.ReadAt, nil
+		}
+		return Usage{}, time.Time{}, fmt.Errorf("usage: backing off for slot %d until %s", a.Slot, e.BlockedUntil.Format(time.RFC3339))
 	}
 
 	tok, err := tokenFor(a)
@@ -66,11 +83,22 @@ func Cached(ctx context.Context, a account.Account) (Usage, time.Time, error) {
 		u, err = fetch(ctx, tok)
 	}
 	if err != nil {
+		backoff := 60 * time.Second
+		var rl *RateLimitedError
+		if errors.As(err, &rl) {
+			backoff = rl.RetryAfter
+		}
+		e.BlockedUntil = now.Add(backoff)
+		cache[a.Slot] = e
+		saveCache(cache)
+		if !e.ReadAt.IsZero() {
+			return e.Usage, e.ReadAt, nil // serve the last good reading
+		}
 		return Usage{}, time.Time{}, err
 	}
 
-	now := nowFn()
-	cache[a.Slot] = entry{Usage: u, ReadAt: now}
+	e = entry{Usage: u, ReadAt: now} // success clears any backoff
+	cache[a.Slot] = e
 	saveCache(cache)
 	return u, now, nil
 }
@@ -99,8 +127,6 @@ func saveCache(m map[int]entry) {
 	}
 }
 
-// lock takes a short-lived directory lock around the cache read-modify-write so
-// concurrent `switcch list` calls coalesce instead of each hitting the endpoint.
 func lock() (func(), error) {
 	lp := filepath.Join(dataHome(), ".usage.lock")
 	_ = os.MkdirAll(dataHome(), 0o700)
@@ -117,8 +143,8 @@ func lock() (func(), error) {
 	return nil, errors.New("usage: cache lock timeout")
 }
 
-// defaultTokenFor returns a valid access token for the account, refreshing the
-// stored credential if it is expired.
+// defaultTokenFor returns a valid access token, refreshing if the stored token
+// is expired.
 func defaultTokenFor(a account.Account) (string, error) {
 	cred, err := credfile.Read(a.Slot)
 	if err != nil {
@@ -131,26 +157,36 @@ func defaultTokenFor(a account.Account) (string, error) {
 	if !blob.IsExpired(time.Now()) {
 		return blob.AccessToken(), nil
 	}
-	return refreshAndStore(a, blob)
+	return refreshToken(a, false)
 }
 
 // defaultForceRefresh refreshes regardless of expiry (used after a 401).
-func defaultForceRefresh(a account.Account) (string, error) {
-	cred, err := credfile.Read(a.Slot)
-	if err != nil {
-		return "", err
-	}
-	blob, err := credblob.Parse([]byte(cred))
-	if err != nil {
-		return "", err
-	}
-	return refreshAndStore(a, blob)
-}
+func defaultForceRefresh(a account.Account) (string, error) { return refreshToken(a, true) }
 
-func refreshAndStore(a account.Account, blob *credblob.Blob) (string, error) {
+// refreshToken refreshes the stored credential under the SAME profile-dir lock a
+// live session/launch uses, re-reading the credential inside the lock so it
+// never refreshes from a stale (already-rotated) token — the double-spend that
+// would otherwise kill a healthy account.
+func refreshToken(a account.Account, force bool) (string, error) {
+	dir := profile.Dir(a)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
 	var token string
-	err := oauth.WithRefreshLock(credfile.Path(a.Slot), func() error {
-		tr, err := oauth.Refresh(context.Background(), blob.RefreshToken())
+	err := oauth.WithRefreshLock(dir, func() error {
+		cred, err := credfile.Read(a.Slot)
+		if err != nil {
+			return err
+		}
+		blob, err := credblob.Parse([]byte(cred))
+		if err != nil {
+			return err
+		}
+		if !force && !blob.IsExpired(time.Now()) {
+			token = blob.AccessToken() // another holder already refreshed
+			return nil
+		}
+		tr, err := oauthRefresh(context.Background(), blob.RefreshToken())
 		if err != nil {
 			return err
 		}

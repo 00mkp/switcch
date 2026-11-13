@@ -12,8 +12,49 @@ import (
 
 func saveSeams(t *testing.T) {
 	t.Helper()
-	a, b, c, d, e := serveTTL, nowFn, fetch, tokenFor, forceRefresh
-	t.Cleanup(func() { serveTTL, nowFn, fetch, tokenFor, forceRefresh = a, b, c, d, e })
+	a, b, c, d, e, j := serveTTL, nowFn, fetch, tokenFor, forceRefresh, jitterFn
+	t.Cleanup(func() { serveTTL, nowFn, fetch, tokenFor, forceRefresh, jitterFn = a, b, c, d, e, j })
+	jitterFn = func() time.Duration { return 0 } // deterministic TTL in tests
+}
+
+func TestCacheBacksOffOn429AndServesStale(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	saveSeams(t)
+	cur := time.Now()
+	nowFn = func() time.Time { return cur }
+	tokenFor = func(account.Account) (string, error) { return "AT", nil }
+	forceRefresh = func(account.Account) (string, error) { return "AT", nil }
+	calls := 0
+	fetch = func(ctx context.Context, tok string) (Usage, error) {
+		calls++
+		if calls == 1 {
+			return Usage{FiveHour: Window{Utilization: 5}}, nil
+		}
+		return Usage{}, &RateLimitedError{RetryAfter: 300 * time.Second}
+	}
+	a := account.Account{Slot: 1}
+
+	if _, _, err := Cached(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	cur = cur.Add(serveTTL + time.Second) // force a refetch → hits the 429
+	u, _, err := Cached(context.Background(), a)
+	if err != nil {
+		t.Fatalf("on 429 with a prior reading, Cached should serve stale, got %v", err)
+	}
+	if u.FiveHour.Utilization != 5 {
+		t.Fatalf("served usage = %v, want the stale 5", u.FiveHour.Utilization)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+	cur = cur.Add(10 * time.Second) // still inside the 300s backoff window
+	if _, _, err := Cached(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("within backoff window Cached must not refetch; calls = %d", calls)
+	}
 }
 
 func TestCacheServesWithinTTLThenRefetches(t *testing.T) {

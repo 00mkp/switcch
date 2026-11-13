@@ -9,14 +9,39 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
 // endpoint is overridable in tests.
 var endpoint = "https://api.anthropic.com/api/oauth/usage"
 
+// httpClient bounds every usage request so a hung endpoint can't wedge the CLI
+// (and hold the cache lock).
+var httpClient = &http.Client{Timeout: 15 * time.Second}
+
 // ErrUnauthorized means the access token is expired/invalid (HTTP 401).
 var ErrUnauthorized = errors.New("usage: unauthorized (token expired)")
+
+// RateLimitedError is returned on HTTP 429, carrying the server's Retry-After.
+type RateLimitedError struct{ RetryAfter time.Duration }
+
+func (e *RateLimitedError) Error() string {
+	return fmt.Sprintf("usage: rate limited (retry after %s)", e.RetryAfter)
+}
+
+func parseRetryAfter(h string) time.Duration {
+	if secs, err := strconv.Atoi(strings.TrimSpace(h)); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(h); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 60 * time.Second
+}
 
 // Window is one rate-limit window's utilization and reset time.
 type Window struct {
@@ -65,13 +90,16 @@ func Fetch(ctx context.Context, accessToken string) (Usage, error) {
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return Usage{}, fmt.Errorf("usage: request: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized {
 		return Usage{}, ErrUnauthorized
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return Usage{}, &RateLimitedError{RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode/100 != 2 {

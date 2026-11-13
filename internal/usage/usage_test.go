@@ -6,7 +6,26 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
+
+func TestFetch429ReturnsRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	endpoint = srv.URL
+
+	_, err := Fetch(context.Background(), "AT")
+	var rl *RateLimitedError
+	if !errors.As(err, &rl) {
+		t.Fatalf("err = %v, want *RateLimitedError", err)
+	}
+	if rl.RetryAfter != 120*time.Second {
+		t.Fatalf("RetryAfter = %v, want 120s", rl.RetryAfter)
+	}
+}
 
 const fixture = `{
   "five_hour": {"utilization": 2.0, "resets_at": "2026-09-23T12:59:59.593033+00:00"},
