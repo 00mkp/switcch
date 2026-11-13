@@ -8,8 +8,39 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/00mkp/switcch/internal/account"
 	"github.com/00mkp/switcch/internal/oauth"
+	"github.com/00mkp/switcch/internal/session"
+	"github.com/00mkp/switcch/internal/usage"
 )
+
+func TestRenderList(t *testing.T) {
+	accts := []account.Account{
+		{Slot: 1, Email: "a@x.com", Alias: "personal"},
+		{Slot: 2, Email: "b@y.com", Alias: "work"},
+	}
+	sessions := []session.Session{{Slot: 2, PID: 123, Cwd: "/w"}}
+	usageOf := func(a account.Account) (usage.Usage, bool) {
+		if a.Slot == 1 {
+			return usage.Usage{FiveHour: usage.Window{Utilization: 12}, SevenDay: usage.Window{Utilization: 40}}, true
+		}
+		return usage.Usage{FiveHour: usage.Window{Utilization: 3}, SevenDay: usage.Window{Utilization: 5}}, true
+	}
+	out := renderList(accts, sessions, usageOf)
+
+	if !strings.Contains(out, "personal") || !strings.Contains(out, "work") {
+		t.Fatalf("missing account labels:\n%s", out)
+	}
+	if !strings.Contains(out, "12%") || !strings.Contains(out, "5h") {
+		t.Fatalf("missing usage numbers:\n%s", out)
+	}
+	if !strings.Contains(out, "/w") || !strings.Contains(out, "123") {
+		t.Fatalf("missing the work session:\n%s", out)
+	}
+	if n := strings.Count(out, "session"); n != 1 {
+		t.Fatalf("want exactly one session line (under work), got %d:\n%s", n, out)
+	}
+}
 
 func TestFriendlyLaunchErrorInvalidGrant(t *testing.T) {
 	wrapped := fmt.Errorf("launch: refresh slot 2: %w", oauth.ErrInvalidGrant)
@@ -33,7 +64,7 @@ func TestRoute(t *testing.T) {
 		wantErr   bool
 	}{
 		{args: []string{"add"}, kind: "add"},
-		{args: []string{"accounts"}, kind: "list"},
+		{args: []string{"accounts"}, kind: "accounts"},
 		{args: []string{"list"}, kind: "list"},
 		{args: []string{"remove", "work"}, kind: "remove", ref: "work"},
 		{args: []string{"work"}, kind: "launch", ref: "work"},

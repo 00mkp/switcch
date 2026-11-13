@@ -6,15 +6,44 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/00mkp/switcch/internal/account"
 	"github.com/00mkp/switcch/internal/capture"
 	"github.com/00mkp/switcch/internal/launch"
 	"github.com/00mkp/switcch/internal/oauth"
+	"github.com/00mkp/switcch/internal/session"
+	"github.com/00mkp/switcch/internal/usage"
 )
+
+// renderList builds the `cswap list`-style tree: each account with its usage and
+// its live sessions nested beneath. Pure, so it is testable without the network.
+func renderList(accts []account.Account, sessions []session.Session, usageOf func(account.Account) (usage.Usage, bool)) string {
+	var b strings.Builder
+	for _, a := range accts {
+		label := a.Email
+		if a.Alias != "" {
+			label += " (" + a.Alias + ")"
+		}
+		fmt.Fprintf(&b, "%d: %s\n", a.Slot, label)
+		if u, ok := usageOf(a); ok {
+			fmt.Fprintf(&b, "   5h: %3.0f%%   7d: %3.0f%%\n", u.FiveHour.Utilization, u.SevenDay.Utilization)
+			for _, m := range u.Models {
+				fmt.Fprintf(&b, "   %s: %3.0f%%\n", m.Model, m.Percent)
+			}
+		}
+		for _, s := range sessions {
+			if s.Slot == a.Slot {
+				fmt.Fprintf(&b, "   ● session pid %d  %s\n", s.PID, s.Cwd)
+			}
+		}
+	}
+	return b.String()
+}
 
 // friendlyLaunchError turns a rotated/expired-credential failure into actionable
 // guidance; other errors pass through unchanged.
@@ -48,7 +77,9 @@ func route(args []string) (command, error) {
 			}
 		}
 		return c, nil
-	case "accounts", "list":
+	case "accounts":
+		return command{kind: "accounts"}, nil
+	case "list":
 		return command{kind: "list"}, nil
 	case "remove":
 		if len(args) < 2 {
@@ -84,7 +115,7 @@ func run(args []string) error {
 		}
 		fmt.Printf("Added account %d: %s%s\n", a.Slot, a.Email, label)
 		return nil
-	case "list":
+	case "accounts":
 		accts := store.List()
 		if len(accts) == 0 {
 			fmt.Println("No accounts registered. Run `switcch add` while logged in to Claude Code.")
@@ -97,6 +128,21 @@ func run(args []string) error {
 			}
 			fmt.Printf("  %d: %s%s\n", a.Slot, a.Email, label)
 		}
+		return nil
+	case "list":
+		accts := store.List()
+		if len(accts) == 0 {
+			fmt.Println("No accounts registered. Run `switcch add` while logged in to Claude Code.")
+			return nil
+		}
+		sessions, _ := session.List()
+		fmt.Print(renderList(accts, sessions, func(a account.Account) (usage.Usage, bool) {
+			u, _, err := usage.Cached(context.Background(), a)
+			if err != nil {
+				return usage.Usage{}, false
+			}
+			return u, true
+		}))
 		return nil
 	case "remove":
 		a, err := capture.Forget(store, cmd.ref)
