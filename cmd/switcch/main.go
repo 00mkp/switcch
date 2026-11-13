@@ -122,7 +122,7 @@ type command struct {
 // route classifies CLI args into a command without performing any side effects.
 func route(args []string) (command, error) {
 	if len(args) == 0 {
-		return command{}, fmt.Errorf("usage: switcch <account> | add [--alias NAME] | accounts | remove <account>")
+		return command{}, errors.New("usage: switcch <account|add|accounts|list|status|remove|help> — run `switcch help` for details")
 	}
 	switch args[0] {
 	case "add":
@@ -146,9 +146,29 @@ func route(args []string) (command, error) {
 		return command{kind: "remove", ref: args[1]}, nil
 	case "status":
 		return command{kind: "status"}, nil
+	case "help", "-h", "--help":
+		return command{kind: "help"}, nil
 	default:
 		return command{kind: "launch", ref: args[0], claudeArgs: args[1:]}, nil
 	}
+}
+
+const usageText = `switcch — run multiple Claude accounts side by side.
+
+Usage:
+  switcch <account>           launch an isolated Claude Code session for an account
+                              (by alias, email, or slot number); extra args pass to claude
+  switcch add [--alias NAME]  register the currently logged-in account
+  switcch accounts            list registered accounts
+  switcch list                accounts with usage (5h/7d) and live sessions
+  switcch status --json       machine-readable status
+  switcch remove <account>    forget an account (deletes its stored credential)
+  switcch help                show this help`
+
+// unknownRefError explains that a first argument matched neither a command nor a
+// registered account (e.g. a mistyped subcommand).
+func unknownRefError(ref string) error {
+	return fmt.Errorf("%q is not a switcch command or a registered account — run `switcch help` for commands, or `switcch accounts` to list accounts", ref)
 }
 
 func run(args []string) error {
@@ -229,10 +249,16 @@ func run(args []string) error {
 		}
 		fmt.Println(string(b))
 		return nil
+	case "help":
+		fmt.Println(usageText)
+		return nil
 	case "launch":
 		a, err := store.Resolve(cmd.ref)
 		if err != nil {
-			return fmt.Errorf("%w (see `switcch accounts`)", err)
+			if errors.Is(err, account.ErrNoAccount) {
+				return unknownRefError(cmd.ref)
+			}
+			return err
 		}
 		dir, env, err := launch.Prepare(a)
 		if err != nil {

@@ -122,6 +122,8 @@ func TestRoute(t *testing.T) {
 		{args: []string{"list"}, kind: "list"},
 		{args: []string{"remove", "work"}, kind: "remove", ref: "work"},
 		{args: []string{"status", "--json"}, kind: "status"},
+		{args: []string{"help"}, kind: "help"},
+		{args: []string{"--help"}, kind: "help"},
 		{args: []string{"work"}, kind: "launch", ref: "work"},
 		{args: []string{}, wantErr: true},
 		{args: []string{"remove"}, wantErr: true}, // remove needs a ref
@@ -143,6 +145,16 @@ func TestRoute(t *testing.T) {
 		if cmd.ref != c.ref {
 			t.Fatalf("args %v: ref = %q, want %q", c.args, cmd.ref, c.ref)
 		}
+	}
+}
+
+func TestUnknownRefError(t *testing.T) {
+	msg := unknownRefError("satatus").Error()
+	if !strings.Contains(msg, "satatus") {
+		t.Fatalf("message should name the input: %q", msg)
+	}
+	if !strings.Contains(msg, "command") || !strings.Contains(msg, "accounts") {
+		t.Fatalf("message should mention it's neither a command nor account and point to `accounts`: %q", msg)
 	}
 }
 
