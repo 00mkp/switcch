@@ -96,3 +96,20 @@ func TestSyncBackupIgnoresGarbage(t *testing.T) {
 		t.Fatal("garbage must not overwrite a good backup")
 	}
 }
+
+// A late capture-back must never move the backup backward to an older token
+// (whose refresh token may already be spent).
+func TestSyncBackupNeverRegressesToOlder(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	a := account.Account{Slot: 1}
+	if err := credfile.Write(a.Slot, credJSON("NEWER", "RT2", time.Now().Add(2*time.Hour).UnixMilli())); err != nil {
+		t.Fatal(err)
+	}
+	if err := SyncBackup(a, credJSON("OLDER", "RT1", time.Now().Add(time.Hour).UnixMilli())); err != nil {
+		t.Fatal(err)
+	}
+	fc, _ := credfile.Read(a.Slot)
+	if !strings.Contains(fc, "NEWER") {
+		t.Fatalf("backup regressed to an older token: %s", fc)
+	}
+}

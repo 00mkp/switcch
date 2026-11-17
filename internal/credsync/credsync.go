@@ -111,6 +111,12 @@ func SyncBackup(a account.Account, cred string) error {
 	if err != nil || blob.AccessToken() == "" {
 		return nil
 	}
+	// Write-if-newer: a late capture-back (outside the refresh lock) must never
+	// move the backup backward to an older token whose refresh token may already
+	// be spent by a concurrent refresh.
+	if onDisk, rerr := credfile.Read(a.Slot); rerr == nil && expiresAtMs(onDisk) >= expiresAtMs(cred) {
+		return nil
+	}
 	return credfile.Write(a.Slot, cred)
 }
 
