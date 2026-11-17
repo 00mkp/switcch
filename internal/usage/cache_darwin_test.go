@@ -4,12 +4,16 @@ package usage
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/00mkp/switcch/internal/account"
 	"github.com/00mkp/switcch/internal/credfile"
+	"github.com/00mkp/switcch/internal/keychain"
 	"github.com/00mkp/switcch/internal/oauth"
+	"github.com/00mkp/switcch/internal/profile"
 )
 
 // Exercises the REAL refresh path (profile-dir lock + credfile), which the
@@ -42,5 +46,42 @@ func TestRefreshTokenRealPathLocksDirAndPersists(t *testing.T) {
 	}
 	if !strings.Contains(cred, "NEW") {
 		t.Fatal("rotated token was not persisted")
+	}
+}
+
+// When the profile keychain holds a fresh token (Claude rotated it), usage must
+// use it and NOT refresh the stale file backup.
+func TestTokenForUsesLiveProfileKeychain(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	a := account.Account{Slot: 1, Email: "a@x.com"}
+	// File backup is expired — would trigger a refresh if it were the source.
+	if err := credfile.Write(a.Slot, `{"claudeAiOauth":{"accessToken":"OLD","refreshToken":"RT","expiresAt":1}}`); err != nil {
+		t.Fatal(err)
+	}
+	// Profile keychain holds a FRESH token (small enough for the keychain CLI).
+	svc := keychain.ServiceName(profile.Dir(a))
+	fresh := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"LIVE","refreshToken":"RT2","expiresAt":%d}}`, time.Now().Add(time.Hour).UnixMilli())
+	if err := keychain.Write(svc, fresh); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = keychain.Delete(svc) })
+
+	orig := oauthRefresh
+	t.Cleanup(func() { oauthRefresh = orig })
+	refreshed := false
+	oauthRefresh = func(context.Context, string) (oauth.TokenResponse, error) {
+		refreshed = true
+		return oauth.TokenResponse{}, nil
+	}
+
+	tok, err := defaultTokenFor(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "LIVE" {
+		t.Fatalf("token = %q, want LIVE (from the profile keychain)", tok)
+	}
+	if refreshed {
+		t.Fatal("must not refresh when the profile keychain already has a fresh token")
 	}
 }

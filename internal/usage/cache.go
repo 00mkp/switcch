@@ -13,6 +13,7 @@ import (
 	"github.com/00mkp/switcch/internal/account"
 	"github.com/00mkp/switcch/internal/credblob"
 	"github.com/00mkp/switcch/internal/credfile"
+	"github.com/00mkp/switcch/internal/credsync"
 	"github.com/00mkp/switcch/internal/oauth"
 	"github.com/00mkp/switcch/internal/profile"
 )
@@ -146,7 +147,7 @@ func lock() (func(), error) {
 // defaultTokenFor returns a valid access token, refreshing if the stored token
 // is expired.
 func defaultTokenFor(a account.Account) (string, error) {
-	cred, err := credfile.Read(a.Slot)
+	cred, err := credsync.Current(a) // prefer Claude's live profile-keychain token
 	if err != nil {
 		return "", err
 	}
@@ -174,7 +175,7 @@ func refreshToken(a account.Account, force bool) (string, error) {
 	}
 	var token string
 	err := oauth.WithRefreshLock(dir, func() error {
-		cred, err := credfile.Read(a.Slot)
+		cred, err := credsync.Current(a) // freshest: Claude's profile keychain, else backup
 		if err != nil {
 			return err
 		}
