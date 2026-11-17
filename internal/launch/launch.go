@@ -15,6 +15,7 @@ import (
 	"github.com/00mkp/switcch/internal/account"
 	"github.com/00mkp/switcch/internal/credblob"
 	"github.com/00mkp/switcch/internal/credfile"
+	"github.com/00mkp/switcch/internal/credsync"
 	"github.com/00mkp/switcch/internal/oauth"
 	"github.com/00mkp/switcch/internal/profile"
 	"github.com/00mkp/switcch/internal/session"
@@ -22,7 +23,10 @@ import (
 
 // Indirected for tests.
 var (
-	readBackupCred    = credfile.Read
+	// currentCred reads the freshest credential (Claude's live profile keychain,
+	// else the backup) and syncs the backup — the capture-back that keeps the
+	// token from going stale. Called before seeding, which clears the keychain.
+	currentCred       = credsync.Current
 	writeBackupCred   = credfile.Write
 	refresh           = oauth.Refresh
 	withRefreshLock   = oauth.WithRefreshLock
@@ -37,7 +41,7 @@ var (
 // and the environment to launch Claude Code with. It refreshes the credential if
 // expired (persisting the rotated blob), seeds the profile, and syncs shared config.
 func Prepare(a account.Account) (string, []string, error) {
-	cred, err := readBackupCred(a.Slot)
+	cred, err := currentCred(a) // capture-back: read Claude's rotated token before the seed clears it
 	if err != nil {
 		return "", nil, fmt.Errorf("launch: load credential for slot %d: %w", a.Slot, err)
 	}
@@ -54,7 +58,7 @@ func Prepare(a account.Account) (string, []string, error) {
 			// Re-read inside the lock: another holder may have refreshed while we
 			// waited, and refreshing from the pre-lock (now-spent) token would
 			// double-spend the rotating refresh token and kill a healthy account.
-			fresh, err := readBackupCred(a.Slot)
+			fresh, err := currentCred(a)
 			if err != nil {
 				return err
 			}

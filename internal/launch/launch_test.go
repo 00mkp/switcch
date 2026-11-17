@@ -23,7 +23,7 @@ func TestPrepareRecordsSession(t *testing.T) {
 
 	acc := account.Account{Slot: 3, Email: "a@x.com"}
 	valid := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"OK","refreshToken":"RT","expiresAt":%d}}`, time.Now().Add(time.Hour).UnixMilli())
-	readBackupCred = func(int) (string, error) { return valid, nil }
+	currentCred = func(account.Account) (string, error) { return valid, nil }
 	writeBackupCred = func(int, string) error { return nil }
 	refresh = func(context.Context, string) (oauth.TokenResponse, error) { return oauth.TokenResponse{}, nil }
 	withRefreshLock = func(string, func() error) error { return nil }
@@ -48,10 +48,10 @@ func TestPrepareRecordsSession(t *testing.T) {
 
 func saveRestore(t *testing.T) {
 	t.Helper()
-	a, b, c, d := readBackupCred, writeBackupCred, refresh, withRefreshLock
+	a, b, c, d := currentCred, writeBackupCred, refresh, withRefreshLock
 	e, f, g, h := seed, syncShared, profileDirFn, defaultClaudeHome
 	t.Cleanup(func() {
-		readBackupCred, writeBackupCred, refresh, withRefreshLock = a, b, c, d
+		currentCred, writeBackupCred, refresh, withRefreshLock = a, b, c, d
 		seed, syncShared, profileDirFn, defaultClaudeHome = e, f, g, h
 	})
 }
@@ -61,7 +61,7 @@ func TestPrepareRefreshesExpiredAndBuildsEnv(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "leak")
 	acc := account.Account{Slot: 1, Email: "a@x.com"}
 
-	readBackupCred = func(slot int) (string, error) {
+	currentCred = func(account.Account) (string, error) {
 		return `{"claudeAiOauth":{"accessToken":"OLD","refreshToken":"RT","expiresAt":1}}`, nil // expiresAt=1ms => expired
 	}
 	var persisted string
@@ -113,7 +113,7 @@ func TestPrepareReReadsInsideLockAvoidsDoubleSpend(t *testing.T) {
 	expired := `{"claudeAiOauth":{"accessToken":"OLD","refreshToken":"RT0","expiresAt":1}}`
 	fresh := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"NEW","refreshToken":"RT1","expiresAt":%d}}`, time.Now().Add(time.Hour).UnixMilli())
 	calls := 0
-	readBackupCred = func(slot int) (string, error) {
+	currentCred = func(account.Account) (string, error) {
 		calls++
 		if calls == 1 {
 			return expired, nil // pre-lock read sees it expired
@@ -148,7 +148,7 @@ func TestPrepareValidTokenSkipsRefresh(t *testing.T) {
 	saveRestore(t)
 	acc := account.Account{Slot: 1, Email: "a@x.com"}
 	valid := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"OK","refreshToken":"RT","expiresAt":%d}}`, time.Now().Add(time.Hour).UnixMilli())
-	readBackupCred = func(slot int) (string, error) { return valid, nil }
+	currentCred = func(account.Account) (string, error) { return valid, nil }
 	writeBackupCred = func(slot int, cred string) error { return nil }
 	refreshCalls := 0
 	refresh = func(ctx context.Context, rt string) (oauth.TokenResponse, error) {
@@ -166,5 +166,36 @@ func TestPrepareValidTokenSkipsRefresh(t *testing.T) {
 	}
 	if refreshCalls != 0 {
 		t.Fatalf("valid token must not trigger refresh; calls=%d", refreshCalls)
+	}
+}
+
+func TestPrepareCapturesBeforeSeeding(t *testing.T) {
+	saveRestore(t)
+	origRec := record
+	t.Cleanup(func() { record = origRec })
+	acc := account.Account{Slot: 1, Email: "a@x.com"}
+	valid := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"FRESH","refreshToken":"RT","expiresAt":%d}}`, time.Now().Add(time.Hour).UnixMilli())
+	captured := false
+	currentCred = func(account.Account) (string, error) { captured = true; return valid, nil }
+	writeBackupCred = func(int, string) error { return nil }
+	refresh = func(context.Context, string) (oauth.TokenResponse, error) { return oauth.TokenResponse{}, nil }
+	withRefreshLock = func(string, func() error) error { return nil }
+	var seededCred string
+	seed = func(a account.Account, cred string) error {
+		if !captured {
+			t.Fatal("seed ran before capture-back; Claude's rotation would be lost")
+		}
+		seededCred = cred
+		return nil
+	}
+	syncShared = func(string, string) error { return nil }
+	profileDirFn = func(account.Account) string { return "/tmp/p" }
+	defaultClaudeHome = func() string { return "/h" }
+	record = func(session.Session) error { return nil }
+	if _, _, err := Prepare(acc); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(seededCred, "FRESH") {
+		t.Fatalf("seeded %q, want the captured Current credential", seededCred)
 	}
 }
