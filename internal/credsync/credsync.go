@@ -11,6 +11,10 @@ package credsync
 
 import (
 	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/00mkp/switcch/internal/account"
 	"github.com/00mkp/switcch/internal/credblob"
@@ -18,6 +22,58 @@ import (
 	"github.com/00mkp/switcch/internal/keychain"
 	"github.com/00mkp/switcch/internal/profile"
 )
+
+// ErrCannotRecover means the account is not the current live login, so switcch
+// cannot safely re-capture its credential.
+var ErrCannotRecover = errors.New("credsync: cannot recover (account is not the live login)")
+
+// Test seams for self-heal.
+var (
+	readLiveIdentityEmail = defaultLiveEmail
+	readLiveDefaultCred   = func() (string, error) { return keychain.Read(keychain.ServiceName("")) }
+)
+
+// Recover re-captures a dead backup from the live default login, but only when
+// that login's email matches the account — never capture one account's token
+// under another's slot. Returns ErrCannotRecover otherwise.
+func Recover(a account.Account) (string, error) {
+	email, err := readLiveIdentityEmail()
+	if err != nil {
+		return "", err
+	}
+	if a.Email == "" || !strings.EqualFold(email, a.Email) {
+		return "", ErrCannotRecover
+	}
+	cred, err := readLiveDefaultCred()
+	if err != nil {
+		return "", err
+	}
+	if err := SyncBackup(a, cred); err != nil {
+		return "", err
+	}
+	return cred, nil
+}
+
+// defaultLiveEmail reads the live default login's email from ~/.claude.json.
+func defaultLiveEmail() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	b, err := os.ReadFile(filepath.Join(home, ".claude.json"))
+	if err != nil {
+		return "", nil
+	}
+	var top struct {
+		OAuth struct {
+			Email string `json:"emailAddress"`
+		} `json:"oauthAccount"`
+	}
+	if json.Unmarshal(b, &top) != nil {
+		return "", nil
+	}
+	return top.OAuth.Email, nil
+}
 
 // readProfileKeychain reads the account's current credential from its profile's
 // hashed keychain entry (where Claude keeps it fresh). Test seam.

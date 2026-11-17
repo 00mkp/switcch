@@ -199,3 +199,36 @@ func TestPrepareCapturesBeforeSeeding(t *testing.T) {
 		t.Fatalf("seeded %q, want the captured Current credential", seededCred)
 	}
 }
+
+func TestPrepareSelfHealsOnInvalidGrant(t *testing.T) {
+	saveRestore(t)
+	origRec, origRecover := record, recoverCred
+	t.Cleanup(func() { record, recoverCred = origRec, origRecover })
+	acc := account.Account{Slot: 1, Email: "a@x.com"}
+	currentCred = func(account.Account) (string, error) {
+		return `{"claudeAiOauth":{"accessToken":"OLD","refreshToken":"RT","expiresAt":1}}`, nil
+	}
+	writeBackupCred = func(int, string) error { return nil }
+	refresh = func(context.Context, string) (oauth.TokenResponse, error) {
+		return oauth.TokenResponse{}, oauth.ErrInvalidGrant
+	}
+	withRefreshLock = func(dir string, fn func() error) error { return fn() }
+	healed := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"HEALED","refreshToken":"RT3","expiresAt":%d}}`, time.Now().Add(time.Hour).UnixMilli())
+	recovered := false
+	recoverCred = func(account.Account) (string, error) { recovered = true; return healed, nil }
+	var seeded string
+	seed = func(a account.Account, cred string) error { seeded = cred; return nil }
+	syncShared = func(string, string) error { return nil }
+	profileDirFn = func(account.Account) string { return "/tmp/p" }
+	defaultClaudeHome = func() string { return "/h" }
+	record = func(session.Session) error { return nil }
+	if _, _, err := Prepare(acc); err != nil {
+		t.Fatal(err)
+	}
+	if !recovered {
+		t.Fatal("should self-heal on invalid_grant")
+	}
+	if !strings.Contains(seeded, "HEALED") {
+		t.Fatalf("seeded %q, want HEALED", seeded)
+	}
+}

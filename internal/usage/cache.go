@@ -26,6 +26,7 @@ var (
 	tokenFor     = defaultTokenFor
 	forceRefresh = defaultForceRefresh
 	oauthRefresh = oauth.Refresh
+	recoverCred  = credsync.Recover
 	// jitterFn spreads refetch times (0..20% of TTL) so accounts don't all
 	// refetch in lockstep. Zeroed in tests for determinism.
 	jitterFn = func() time.Duration { return time.Duration(rand.Int63n(int64(serveTTL / 5))) }
@@ -188,6 +189,16 @@ func refreshToken(a account.Account, force bool) (string, error) {
 			return nil
 		}
 		tr, err := oauthRefresh(context.Background(), blob.RefreshToken())
+		if errors.Is(err, oauth.ErrInvalidGrant) {
+			// The refresh lineage is dead (spent by a session outside switcch).
+			// Self-heal from the live login if this account is it.
+			if rec, rerr := recoverCred(a); rerr == nil {
+				if rb, perr := credblob.Parse([]byte(rec)); perr == nil && !rb.IsExpired(time.Now()) {
+					token = rb.AccessToken()
+					return nil
+				}
+			}
+		}
 		if err != nil {
 			return err
 		}

@@ -85,3 +85,30 @@ func TestTokenForUsesLiveProfileKeychain(t *testing.T) {
 		t.Fatal("must not refresh when the profile keychain already has a fresh token")
 	}
 }
+
+func TestRefreshSelfHealsOnInvalidGrant(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	a := account.Account{Slot: 1, Email: "a@x.com"}
+	if err := credfile.Write(a.Slot, `{"claudeAiOauth":{"accessToken":"OLD","refreshToken":"RT","expiresAt":1}}`); err != nil {
+		t.Fatal(err)
+	}
+	o1, o2 := oauthRefresh, recoverCred
+	t.Cleanup(func() { oauthRefresh, recoverCred = o1, o2 })
+	oauthRefresh = func(context.Context, string) (oauth.TokenResponse, error) {
+		return oauth.TokenResponse{}, oauth.ErrInvalidGrant
+	}
+	healed := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"HEALED","refreshToken":"RT3","expiresAt":%d}}`, time.Now().Add(time.Hour).UnixMilli())
+	recovered := false
+	recoverCred = func(account.Account) (string, error) { recovered = true; return healed, nil }
+
+	tok, err := refreshToken(a, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovered {
+		t.Fatal("should self-heal via recoverCred on invalid_grant")
+	}
+	if tok != "HEALED" {
+		t.Fatalf("token = %q, want HEALED", tok)
+	}
+}

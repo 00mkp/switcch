@@ -5,6 +5,7 @@ package launch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -35,6 +36,7 @@ var (
 	profileDirFn      = profile.Dir
 	defaultClaudeHome = func() string { home, _ := os.UserHomeDir(); return filepath.Join(home, ".claude") }
 	record            = session.Record
+	recoverCred       = credsync.Recover
 )
 
 // Prepare readies account a's isolated profile and returns its CLAUDE_CONFIG_DIR
@@ -71,6 +73,14 @@ func Prepare(a account.Account) (string, []string, error) {
 				return nil
 			}
 			tr, err := refresh(context.Background(), fb.RefreshToken())
+			if errors.Is(err, oauth.ErrInvalidGrant) {
+				// Dead lineage (rotated by a session outside switcch); self-heal
+				// from the live login if this account is it.
+				if rec, rerr := recoverCred(a); rerr == nil {
+					cred = rec
+					return nil
+				}
+			}
 			if err != nil {
 				return err
 			}
