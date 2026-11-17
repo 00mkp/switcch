@@ -18,7 +18,12 @@
 ## Global Constraints
 
 - **Failover is configured per account, once** (decided with the user 2026-11-17; comma/pool-name syntaxes rejected): `switcch fallback <account> <account>[ <account>...]` sets an ordered fallback list on an account; `switcch fallback <account> --clear` removes it. Stored on the account in the registry **by slot number** (alias renames don't break it). Launching stays `switcch <account>`: the session's pool is that account followed by its fallback list. An account with no fallback is a **pin** (no failover; rations as today). **No transitive chaining** — only the launched account's own list is used (prevents loops). Per-launch overrides: `--pin` (no failover this session) and `--fallback <account>[,<account>]` (use this list instead). `switcch accounts` shows each account's fallback.
-- Defaults (config `${XDG_CONFIG_HOME:-~/.config}/switcch/config.json`, overridable per launch with `--mode auto|advisory`, `--threshold N`): mode `auto`, threshold `95` (% of 5h or 7d), notice text as above.
+- Defaults (decided with the user 2026-11-17), stored in `${XDG_CONFIG_HOME:-~/.config}/switcch/config.json`, changeable with `switcch config set <key> <value>` and overridable per launch:
+  - `trigger`: **`proactive`** (default) — switch once the active account crosses `threshold`, at the next turn end; or `reactive` — switch only on an actual limit hit. Flag: `--trigger proactive|reactive`.
+  - `threshold`: **`90`** (% of the 5h or 7d window, whichever is higher); any value 1–100. Flag: `--threshold N`. Ignored when `trigger` is `reactive`.
+  - `mode`: `auto` (default — actually switch) or `advisory` (notify only, never switch). Flag: `--mode`.
+  - A hard limit always triggers a switch in `auto` mode, whatever `trigger` is.
+  - `notice`: the in-chat notice text above.
 - Hooks are installed into the user's real `~/.claude/settings.json` (shared into every profile). Preserve all other keys and hooks; tag switcch's entries so `switcch uninstall-hooks` removes exactly them. Outside a switcch session the hook must exit 0 and do nothing.
 - Classifier must be conservative (a false positive restarts a healthy session): match only the strong limit phrases and `rate_limit` on `StopFailure`; reject foreign-content markers and the context/token-limit denylist (tech-discovery §1).
 - Unset `CLAUDE_CODE_RETRY_WATCHDOG` in the child env (it can suppress `StopFailure`).
@@ -56,10 +61,10 @@ Model-cap fallback (try another model before switching accounts), opt-in wait-fo
 
 **Interfaces:**
 - `Account.Fallback []int` (slot numbers, `json:"fallback,omitempty"`). `(*Store) SetFallback(ref string, refs []string) error` (resolves each ref to a slot; rejects self-reference and unknown refs); `(*Store) Pool(a Account) []Account` returns `[a] + a.Fallback` resolved, silently skipping slots that no longer exist. `Remove` also strips the removed slot from every other account's fallback.
-- `config.Load() (Config, error)`: `Mode string`, `Threshold float64`, `Notice string`, defaults above.
-- `route`: `fallback <acct> <acct>...` / `fallback <acct> --clear`; launch accepts `--pin`, `--fallback a,b`, `--mode M`, `--threshold N`, and `--` for claude args.
+- `config.Load() (Config, error)`: `Trigger string` (`proactive`|`reactive`), `Threshold float64`, `Mode string`, `Notice string`, defaults above; `config.Set(key, value string) error` validates (trigger/mode enums, threshold 1–100) and persists.
+- `route`: `fallback <acct> <acct>...` / `fallback <acct> --clear`; `config set <key> <value>` / `config show`; launch accepts `--pin`, `--fallback a,b`, `--trigger T`, `--threshold N`, `--mode M`, and `--` for claude args.
 
-- [ ] **Step 1: failing tests** — `SetFallback("work", ["personal"])` stores personal's slot; `Pool(work)` ⇒ `[work, personal]`; `Pool(personal)` ⇒ `[personal]` (pin); self-reference and unknown refs error; removing personal strips it from work's fallback; fallback survives an alias rename. `route(["work","--pin"])` ⇒ pin; `route(["work","--fallback","other","--threshold","90","--","--resume"])` ⇒ override list, threshold 90, claudeArgs `[--resume]`; config defaults when the file is absent; malformed config errors clearly.
+- [ ] **Step 1: failing tests** — `SetFallback("work", ["personal"])` stores personal's slot; `Pool(work)` ⇒ `[work, personal]`; `Pool(personal)` ⇒ `[personal]` (pin); self-reference and unknown refs error; removing personal strips it from work's fallback; fallback survives an alias rename. `route(["work","--pin"])` ⇒ pin; `route(["work","--fallback","other","--threshold","90","--","--resume"])` ⇒ override list, threshold 90, claudeArgs `[--resume]`; config defaults are trigger `proactive`, threshold `90` when the file is absent; `config.Set("threshold","85")` persists, `Set("threshold","150")` and `Set("trigger","sometimes")` error; malformed config errors clearly.
 - [ ] **Step 2–4:** implement + verify; `switcch accounts` lists `→ fallback: personal`.
 - [ ] **Step 5: commit** — `feat(account): per-account failover list, mode and threshold`.
 
@@ -97,9 +102,9 @@ Model-cap fallback (try another model before switching accounts), opt-in wait-fo
 
 **Files:** Modify `internal/supervise/supervise.go` (+ tests)
 
-**Interfaces:** While running, poll `usage.Cached(active)` every 60s; if max(5h, 7d) ≥ threshold: `auto` ⇒ arm a switch and perform it on the next `Stopped` signal (turn end, so no turn is cut off); `advisory` ⇒ post one macOS notification (`osascript -e 'display notification ...'`, seam for tests) and never switch.
+**Interfaces:** When `trigger` is `proactive`, poll `usage.Cached(active)` every 60s while running; if max(5h, 7d) ≥ threshold: `auto` ⇒ arm a switch and perform it on the next `Stopped` signal (turn end, so no turn is cut off); `advisory` ⇒ post one macOS notification (`osascript -e 'display notification ...'`, seam for tests) and never switch. When `trigger` is `reactive`, skip polling entirely (only the hard-limit path from Task 5 applies).
 
-- [ ] **Step 1: failing test** — with stubbed usage at 96% and threshold 95: auto + `Stopped` ⇒ Switch; auto with no `Stopped` yet ⇒ no switch; advisory ⇒ one notification, no switch.
+- [ ] **Step 1: failing test** — stubbed usage at 91%, threshold 90: proactive+auto+`Stopped` ⇒ Switch; proactive+auto with no `Stopped` yet ⇒ no switch; proactive+advisory ⇒ one notification, no switch; reactive ⇒ usage is never polled and no switch at 91%.
 - [ ] **Step 2–4:** implement + verify.
 - [ ] **Step 5: commit** — `feat(supervise): proactive threshold switch and advisory notices`.
 
