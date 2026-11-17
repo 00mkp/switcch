@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans (native) to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax.
 
-**Goal:** A switcch session can be given a pool of accounts. When the active account hits its limit (or crosses a usage threshold), switcch moves the *same conversation* to the next account automatically and tells you in the chat. Any existing chat — started in switcch on another account, or outside switcch with plain `claude`/cswap — can be resumed under any switcch account.
+**Goal:** An account can be given a fallback list once (`switcch fallback work personal`); every session launched on it then has that pool. When the active account hits its limit (or crosses a usage threshold), switcch moves the *same conversation* to the next account automatically and tells you in the chat. Any existing chat — started in switcch on another account, or outside switcch with plain `claude`/cswap — can be resumed under any switcch account.
 
 **Architecture:**
 - **Shared transcripts.** `projects/` and `history.jsonl` join the shared set, so every profile sees every chat. That alone makes `switcch <account> -- --resume` a working *move* and *import* (plain-`claude` chats live in `~/.claude/projects`, which profiles now link to).
@@ -17,7 +17,7 @@
 
 ## Global Constraints
 
-- Pool syntax: `switcch <ref>[,<ref>...]` — ordered; the first is the starting account. A single ref is a **pin** (no failover; rations as today). Refs resolve by alias/email/slot as before.
+- **Failover is configured per account, once** (decided with the user 2026-11-17; comma/pool-name syntaxes rejected): `switcch fallback <account> <account>[ <account>...]` sets an ordered fallback list on an account; `switcch fallback <account> --clear` removes it. Stored on the account in the registry **by slot number** (alias renames don't break it). Launching stays `switcch <account>`: the session's pool is that account followed by its fallback list. An account with no fallback is a **pin** (no failover; rations as today). **No transitive chaining** — only the launched account's own list is used (prevents loops). Per-launch overrides: `--pin` (no failover this session) and `--fallback <account>[,<account>]` (use this list instead). `switcch accounts` shows each account's fallback.
 - Defaults (config `${XDG_CONFIG_HOME:-~/.config}/switcch/config.json`, overridable per launch with `--mode auto|advisory`, `--threshold N`): mode `auto`, threshold `95` (% of 5h or 7d), notice text as above.
 - Hooks are installed into the user's real `~/.claude/settings.json` (shared into every profile). Preserve all other keys and hooks; tag switcch's entries so `switcch uninstall-hooks` removes exactly them. Outside a switcch session the hook must exit 0 and do nothing.
 - Classifier must be conservative (a false positive restarts a healthy session): match only the strong limit phrases and `rate_limit` on `StopFailure`; reject foreign-content markers and the context/token-limit denylist (tech-discovery §1).
@@ -50,15 +50,18 @@ Model-cap fallback (try another model before switching accounts), opt-in wait-fo
 - [ ] **Step 2–4:** implement + verify; whole suite green.
 - [ ] **Step 5: commit** — `feat(profile): share transcripts across profiles (move/import)`.
 
-### Task 2: Pools, modes, thresholds (CLI + config)
+### Task 2: Per-account fallback, modes, thresholds (registry + CLI + config)
 
-**Files:** Create `internal/config/config.go` (+ test); Modify `cmd/switcch/main.go` (+ test)
+**Files:** Modify `internal/account/account.go`, `internal/account/store.go` (+ tests); Create `internal/config/config.go` (+ test); Modify `cmd/switcch/main.go` (+ test)
 
-**Interfaces:** `config.Load() (Config, error)` with `Mode string`, `Threshold float64`, `Notice string` and defaults above. `route` parses `switcch a,b [--mode M] [--threshold N] [-- claude args]` into `command{kind:"launch", pool:[]string, mode, threshold, claudeArgs}`.
+**Interfaces:**
+- `Account.Fallback []int` (slot numbers, `json:"fallback,omitempty"`). `(*Store) SetFallback(ref string, refs []string) error` (resolves each ref to a slot; rejects self-reference and unknown refs); `(*Store) Pool(a Account) []Account` returns `[a] + a.Fallback` resolved, silently skipping slots that no longer exist. `Remove` also strips the removed slot from every other account's fallback.
+- `config.Load() (Config, error)`: `Mode string`, `Threshold float64`, `Notice string`, defaults above.
+- `route`: `fallback <acct> <acct>...` / `fallback <acct> --clear`; launch accepts `--pin`, `--fallback a,b`, `--mode M`, `--threshold N`, and `--` for claude args.
 
-- [ ] **Step 1: failing test** — `route(["work,personal","--threshold","90","--","--resume"])` ⇒ pool `[work personal]`, threshold 90, claudeArgs `[--resume]`; `route(["work"])` ⇒ pool `[work]`; config defaults when the file is absent; a malformed config file errors clearly.
-- [ ] **Step 2–4:** implement + verify.
-- [ ] **Step 5: commit** — `feat(cli): account pools, mode and threshold`.
+- [ ] **Step 1: failing tests** — `SetFallback("work", ["personal"])` stores personal's slot; `Pool(work)` ⇒ `[work, personal]`; `Pool(personal)` ⇒ `[personal]` (pin); self-reference and unknown refs error; removing personal strips it from work's fallback; fallback survives an alias rename. `route(["work","--pin"])` ⇒ pin; `route(["work","--fallback","other","--threshold","90","--","--resume"])` ⇒ override list, threshold 90, claudeArgs `[--resume]`; config defaults when the file is absent; malformed config errors clearly.
+- [ ] **Step 2–4:** implement + verify; `switcch accounts` lists `→ fallback: personal`.
+- [ ] **Step 5: commit** — `feat(account): per-account failover list, mode and threshold`.
 
 ### Task 3: Hook installer
 
@@ -102,6 +105,6 @@ Model-cap fallback (try another model before switching accounts), opt-in wait-fo
 
 ### Task 7: Manual verification (real accounts)
 
-- [ ] `switcch setup`; open a chat with `switcch work,personal --threshold 1` (forces a proactive switch at the first turn end). Confirm the next turn continues the same conversation on personal and the notice appears in the chat; `switcch list` shows the session under personal.
+- [ ] `switcch setup`; `switcch fallback work personal`; open a chat with `switcch work --threshold 1` (forces a proactive switch at the first turn end). Confirm the next turn continues the same conversation on personal and the notice appears in the chat; `switcch list` shows the session under personal.
 - [ ] Exit a chat, then `switcch personal -- --resume` and pick a chat started with plain `claude` — it resumes under personal (import).
 - [ ] `switcch uninstall-hooks` leaves `~/.claude/settings.json` otherwise unchanged.
