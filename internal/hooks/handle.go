@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -25,6 +26,7 @@ type Signal struct {
 	Kind      Kind   `json:"kind"`
 	SessionID string `json:"session_id"`
 	Prompt    string `json:"prompt,omitempty"`
+	Model     string `json:"model,omitempty"` // RateLimited: the capped model family, "" = account-wide
 }
 
 // Marker files in the signal dir (written by the supervisor or the hook).
@@ -86,6 +88,10 @@ var (
 	apiContext     = []string{"api", "anthropic", "claude", "http", "status", "response", "retry-after"}
 )
 
+// modelCap finds a model-specific cap ("Opus limit", "Sonnet weekly limit")
+// in a limit message; a model merely named elsewhere doesn't count.
+var modelCap = regexp.MustCompile(`\b(opus|sonnet|haiku)(?: weekly)? limit\b`)
+
 func containsAny(s string, subs []string) bool {
 	for _, x := range subs {
 		if strings.Contains(s, x) {
@@ -113,7 +119,11 @@ func Classify(event string, raw []byte) Signal {
 			containsAny(text, strongPhrases) ||
 			(containsAny(text, weakPhrases) && containsAny(text, apiContext))
 		if limited {
-			return Signal{Kind: RateLimited, SessionID: p.SessionID}
+			sig := Signal{Kind: RateLimited, SessionID: p.SessionID}
+			if m := modelCap.FindStringSubmatch(text); m != nil {
+				sig.Model = m[1]
+			}
+			return sig
 		}
 	}
 	return Signal{}

@@ -56,13 +56,14 @@ func parseHelp(text string) optSpec {
 // sessionFlags select which conversation to open; a relaunch replaces them.
 var sessionFlags = map[string]bool{"--resume": true, "-r": true, "--session-id": true, "--continue": true, "-c": true, "--fork-session": true}
 
-// relaunchArgs keeps the user's own claude options but drops their positional
+// relaunchArgs keeps the user's own claude options (replacing their --model
+// with model when model != "") but drops their positional
 // prompt (it was already sent — replaying it would re-run it) and any session
 // selection, then appends `--resume <sid> -- <msg>` (`--continue -- <msg>`
 // with no sid). "--" stops a message that starts with "-" from being parsed as
 // an option. With no option table (sp nil) nothing of the user's args can be
 // told apart safely, so only the resume is kept.
-func relaunchArgs(orig []string, sp optSpec, sid, msg string) []string {
+func relaunchArgs(orig []string, sp optSpec, model, sid, msg string) []string {
 	var out []string
 	for i := 0; sp != nil && i < len(orig); i++ {
 		a := orig[i]
@@ -93,9 +94,12 @@ func relaunchArgs(orig []string, sp optSpec, sid, msg string) []string {
 				}
 			}
 		}
-		if !sessionFlags[name] {
+		if !sessionFlags[name] && !(model != "" && name == "--model") {
 			out = append(out, take...)
 		}
+	}
+	if model != "" {
+		out = append(out, "--model", model)
 	}
 	if sid == "" {
 		return append(out, "--continue", "--", msg)

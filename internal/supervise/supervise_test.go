@@ -4,6 +4,7 @@ package supervise
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -104,23 +105,23 @@ func TestParseHelp(t *testing.T) {
 
 func TestRelaunchArgs(t *testing.T) {
 	sp := parseHelp(sampleHelp)
-	got := relaunchArgs([]string{"--model", "opus", "commit and push", "--resume", "old-id", "--add-dir", "a", "b", "-c", "--verbose"}, sp, "sid-9", "- hello")
+	got := relaunchArgs([]string{"--model", "opus", "commit and push", "--resume", "old-id", "--add-dir", "a", "b", "-c", "--verbose"}, sp, "", "sid-9", "- hello")
 	want := []string{"--model", "opus", "--add-dir", "a", "b", "--verbose", "--resume", "sid-9", "--", "- hello"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("relaunchArgs =\n %q\nwant\n %q", got, want)
 	}
 	// Everything after the user's own "--" is positional: dropped.
-	if got := relaunchArgs([]string{"--verbose", "--", "--model"}, sp, "s", "m"); !slices.Equal(got, []string{"--verbose", "--resume", "s", "--", "m"}) {
+	if got := relaunchArgs([]string{"--verbose", "--", "--model"}, sp, "", "s", "m"); !slices.Equal(got, []string{"--verbose", "--resume", "s", "--", "m"}) {
 		t.Fatalf("after --: %q", got)
 	}
-	if got := relaunchArgs([]string{"--model=opus", "hi"}, sp, "s", "m"); !slices.Equal(got, []string{"--model=opus", "--resume", "s", "--", "m"}) {
+	if got := relaunchArgs([]string{"--model=opus", "hi"}, sp, "", "s", "m"); !slices.Equal(got, []string{"--model=opus", "--resume", "s", "--", "m"}) {
 		t.Fatalf("--flag=value: %q", got)
 	}
-	if got := relaunchArgs(nil, sp, "", "hi"); !slices.Equal(got, []string{"--continue", "--", "hi"}) {
+	if got := relaunchArgs(nil, sp, "", "", "hi"); !slices.Equal(got, []string{"--continue", "--", "hi"}) {
 		t.Fatalf("no session id should fall back to --continue, got %q", got)
 	}
 	// Unknown option table (claude --help failed): keep nothing but the resume.
-	if got := relaunchArgs([]string{"--model", "opus", "do X"}, nil, "s", "m"); !slices.Equal(got, []string{"--resume", "s", "--", "m"}) {
+	if got := relaunchArgs([]string{"--model", "opus", "do X"}, nil, "", "s", "m"); !slices.Equal(got, []string{"--resume", "s", "--", "m"}) {
 		t.Fatalf("without a flag table nothing of the user's args may be guessed at: %q", got)
 	}
 }
@@ -179,6 +180,12 @@ func TestHelperProcess(t *testing.T) {
 		switch act {
 		case "ratelimit":
 			hooks.WriteSignal(dir, hooks.Signal{Kind: hooks.RateLimited, SessionID: "sid-1"})
+		case "ratelimit-model": // a model cap for the model this Claude runs
+			m := modelOf(args)
+			if m == "" {
+				m = "opus"
+			}
+			hooks.WriteSignal(dir, hooks.Signal{Kind: hooks.RateLimited, SessionID: "sid-1", Model: m})
 		case "intercept":
 			hooks.WriteSignal(dir, hooks.Signal{Kind: hooks.Intercept, SessionID: "sid-1", Prompt: os.Getenv("FAKE_PROMPT")})
 		}
@@ -243,6 +250,7 @@ type fake struct {
 	prepareFail             map[string]bool
 	claudeArgs              []string
 	mode                    string
+	root                    string // RuntimeDir ("" = a fresh temp dir)
 }
 
 // fakeSeams points the supervisor at the fake claude; returns the log path.
@@ -291,7 +299,8 @@ func runFakeErr(t *testing.T, f fake) ([]launchRec, string, error) {
 	// A deadline turns a relaunch loop into a failure instead of a hung test.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	err := Run(ctx, Options{Pool: f.pool, Config: cfg, ClaudeArgs: f.claudeArgs, RuntimeDir: t.TempDir()})
+	root := cmp.Or(f.root, t.TempDir())
+	err := Run(ctx, Options{Pool: f.pool, Config: cfg, ClaudeArgs: f.claudeArgs, RuntimeDir: root})
 	return readLaunches(t, logp), errBuf.String(), err
 }
 
@@ -714,5 +723,61 @@ func TestRunEmitsLimitAndExhaustion(t *testing.T) {
 	want := []string{"limit_hit/w@x.com", "limit_hit/p@x.com", "pool_exhausted/p@x.com"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("events = %v, want %v", got, want)
+	}
+}
+
+func TestRelaunchArgsModelOverride(t *testing.T) {
+	sp := parseHelp(sampleHelp)
+	for _, orig := range [][]string{{"--model", "opus", "--verbose"}, {"--model=opus", "--verbose"}} {
+		got := relaunchArgs(orig, sp, "sonnet", "s", "m")
+		if want := []string{"--verbose", "--model", "sonnet", "--resume", "s", "--", "m"}; !slices.Equal(got, want) {
+			t.Fatalf("%q → %q, want %q", orig, got, want)
+		}
+	}
+}
+
+func modelOf(a []string) string {
+	for i, x := range a {
+		if x == "--model" && i+1 < len(a) {
+			return a[i+1]
+		}
+	}
+	return ""
+}
+
+func TestRunModelFallbackThenRotate(t *testing.T) {
+	l, _, err := runFakeErr(t, fake{act: "ratelimit-model-always", pool: []account.Account{work, personal}, claudeArgs: []string{"--model", "opus"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, x := range l {
+		got = append(got, strings.TrimPrefix(x.ConfigDir, "/profiles/")+"/"+modelOf(x.Args))
+	}
+	if want := []string{"work/opus", "work/sonnet", "personal/opus", "personal/sonnet"}; !slices.Equal(got, want) {
+		t.Fatalf("launches = %v, want %v", got, want)
+	}
+	if _, msg, _ := resumeOf(l[1].Args); msg != "[switcch] work hit its opus limit — continuing with sonnet." {
+		t.Fatalf("model notice = %q", msg)
+	}
+}
+
+func TestRunPlainLimitSkipsModelFallback(t *testing.T) {
+	l, _, err := runFakeErr(t, fake{act: "ratelimit", pool: []account.Account{work, personal}, claudeArgs: []string{"--model", "opus"}})
+	if err != nil || len(l) != 2 || l[1].ConfigDir != "/profiles/personal" || modelOf(l[1].Args) != "opus" {
+		t.Fatalf("a plain limit must rotate accounts, keeping the user's model: err=%v %+v", err, l)
+	}
+}
+
+func TestModelCapDoesNotMarkAccountLimited(t *testing.T) {
+	// Other chats on work (on other models) must not be pushed off work just
+	// because this chat's Opus is capped.
+	root := t.TempDir()
+	l, _, err := runFakeErr(t, fake{act: "ratelimit-model", pool: []account.Account{work, personal}, claudeArgs: []string{"--model", "opus"}, root: root})
+	if err != nil || len(l) != 2 || l[1].ConfigDir != "/profiles/work" {
+		t.Fatalf("err=%v %+v", err, l)
+	}
+	if _, err := os.Stat(limitedMarker(root, work)); err == nil {
+		t.Fatal("a model cap must not mark the whole account limited")
 	}
 }

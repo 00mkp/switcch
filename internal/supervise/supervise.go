@@ -271,6 +271,10 @@ type chat struct {
 	sid    string // last session id seen from a hook (or --resume)
 	pid    int    // the running Claude
 	failed map[int]bool
+	// Model fallback on the current account: the override in force ("" = the
+	// user's own) and the models already capped or tried there.
+	model       string
+	triedModels map[string]bool
 
 	started     time.Time // first launch of this supervisor (registry)
 	cwd         string
@@ -295,7 +299,9 @@ type move struct {
 	limit     float64 // replacement targets must be under this line
 	prompt    string  // intercepted user message(s), sent verbatim
 	hasPrompt bool
-	hard      bool // caused by a hard limit (no target left ⇒ pool exhausted)
+	hard      bool   // caused by a hard limit (no target left ⇒ pool exhausted)
+	model     string // same-account model fallback: relaunch with --model model
+	fromModel string // …because this model hit its cap
 }
 
 // record writes this chat to the session registry (best-effort) when its
@@ -401,6 +407,18 @@ func (c *chat) tick() *move {
 	// 2. A hard limit: always switches in auto mode; tells other chats on this account.
 	if s, ok := take(c.sigDir, hooks.RateLimited); ok {
 		c.sid = cmp.Or(s.SessionID, c.sid)
+		// A model-specific cap: try another model on this account first.
+		// The account itself isn't exhausted, so no limited marker.
+		if s.Model != "" && auto {
+			c.triedModels[s.Model] = true
+			for _, fm := range cfg.ModelFallback {
+				if fm != s.Model && !c.triedModels[fm] {
+					c.triedModels[fm] = true
+					c.emit(event.LimitHit, c.active)
+					return &move{to: c.active, limit: 100, model: fm, fromModel: s.Model}
+				}
+			}
+		}
 		markLimited(c.mroot, c.active)
 		c.emit(event.LimitHit, c.active)
 		tgt := c.next(100)
@@ -472,7 +490,7 @@ func (c *chat) tick() *move {
 // is delivered on the current account and anything else stays put.
 func (c *chat) commit(m *move) ([]string, bool) {
 	for {
-		if m.to.Slot == c.active.Slot && !m.hasPrompt {
+		if m.to.Slot == c.active.Slot && !m.hasPrompt && m.model == "" {
 			return nil, false
 		}
 		_, env, err := prepare(m.to)
@@ -502,10 +520,15 @@ func (c *chat) commit(m *move) ([]string, bool) {
 // message is the relaunch's first message: the notice (when changing account)
 // and any carried prompt, verbatim.
 func (c *chat) message(m *move) string {
-	if m.to.Slot == c.active.Slot {
+	var msg string
+	switch {
+	case m.model != "":
+		msg = strings.NewReplacer("{account}", name(c.active), "{from}", m.fromModel, "{to}", m.model).Replace(c.o.Config.ModelNotice)
+	case m.to.Slot == c.active.Slot:
 		return m.prompt
+	default:
+		msg = notice(c.o.Config.Notice, c.active, m.to)
 	}
-	msg := notice(c.o.Config.Notice, c.active, m.to)
 	if m.hasPrompt {
 		msg += "\n\n" + m.prompt
 	}
@@ -541,7 +564,7 @@ func Run(ctx context.Context, o Options) error {
 	defer signal.Stop(term)
 
 	c := &chat{o: o, sigDir: sigDir, mroot: markerRoot(root), claude: claude, active: o.Pool[0],
-		sid: resumeID(o.ClaudeArgs), failed: map[int]bool{}, started: time.Now()}
+		sid: resumeID(o.ClaudeArgs), failed: map[int]bool{}, triedModels: map[string]bool{}, started: time.Now()}
 	c.cwd, _ = os.Getwd()
 	_, env, err := prepare(c.active)
 	if err != nil {
@@ -621,7 +644,14 @@ func Run(ctx context.Context, o Options) error {
 		if m.hasPrompt {
 			carried = m.prompt
 		}
-		args = relaunchArgs(o.ClaudeArgs, c.optSpec(), c.sid, c.message(m))
+		msg := c.message(m)
+		if m.to.Slot != c.active.Slot { // new account: its own model allowances
+			c.model, c.triedModels = "", map[string]bool{}
+		}
+		if m.model != "" {
+			c.model = m.model
+		}
+		args = relaunchArgs(o.ClaudeArgs, c.optSpec(), c.model, c.sid, msg)
 		c.active, env = m.to, nextEnv
 	}
 }

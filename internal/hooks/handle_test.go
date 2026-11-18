@@ -179,3 +179,22 @@ func TestStopFailureAlwaysClearsBusy(t *testing.T) {
 		t.Fatal("any StopFailure ends the turn: busy must be cleared")
 	}
 }
+
+func TestClassifyModelCap(t *testing.T) {
+	cases := []struct {
+		name  string
+		p     map[string]any
+		model string
+	}{
+		{"opus cap", map[string]any{"error": "error", "last_assistant_message": "You've reached your Opus limit · resets Mon"}, "opus"},
+		{"sonnet weekly cap", map[string]any{"error": "error", "last_assistant_message": "Sonnet weekly limit reached"}, "sonnet"},
+		{"account-wide 429 naming a model", map[string]any{"error": "rate_limit", "error_details": "429 Too Many Requests (model: claude-opus-4)"}, ""},
+		{"plain session limit", map[string]any{"error": "error", "last_assistant_message": "You've hit your session limit"}, ""},
+	}
+	for _, c := range cases {
+		s := Classify("StopFailure", payload(c.p))
+		if s.Kind != RateLimited || s.Model != c.model {
+			t.Errorf("%s: got kind=%q model=%q, want rate-limited model=%q", c.name, s.Kind, s.Model, c.model)
+		}
+	}
+}
