@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -147,4 +148,74 @@ func TestInstallLeavesUnrelatedHookBytesAlone(t *testing.T) {
 	if b, _ := os.ReadFile(p); string(b) != orig {
 		t.Fatalf("install+uninstall must restore the file byte-for-byte:\n%s", b)
 	}
+}
+
+func isolateLock(t *testing.T) {
+	t.Helper()
+	lp := filepath.Join(t.TempDir(), "settings.lock")
+	o := lockPath
+	t.Cleanup(func() { lockPath = o })
+	lockPath = func() string { return lp }
+}
+
+func TestInstallConcurrent(t *testing.T) {
+	isolateLock(t)
+	p := filepath.Join(t.TempDir(), "settings.json")
+	_ = os.WriteFile(p, []byte(original), 0o644)
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); errs <- Install(p, "/opt/bin/switcch") }()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent install: %v", err)
+		}
+	}
+	for _, ev := range Events {
+		if g := groupsFor(t, p, ev); len(g) != 1 {
+			t.Fatalf("%s: want one switcch group, got %d", ev, len(g))
+		}
+	}
+	if pre := groupsFor(t, p, "PreToolUse"); len(pre) != 1 {
+		t.Fatalf("unrelated hook lost: %+v", pre)
+	}
+}
+
+func TestInstallRetriesWhenFileChangesUnderIt(t *testing.T) {
+	isolateLock(t)
+	p := filepath.Join(t.TempDir(), "settings.json")
+	_ = os.WriteFile(p, []byte(original), 0o644)
+	o := beforeRename
+	t.Cleanup(func() { beforeRename = o })
+	fired := false
+	beforeRename = func() {
+		if !fired { // Claude saves a setting between our read and our rename
+			fired = true
+			b, _ := os.ReadFile(p)
+			_ = os.WriteFile(p, []byte(strings.Replace(string(b), `"model": "x",`, `"model": "x", "theme": "dark",`, 1)), 0o644)
+		}
+	}
+	if err := Install(p, "/opt/bin/switcch"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(p)
+	if !strings.Contains(string(b), `"theme": "dark"`) || len(groupsFor(t, p, "Stop")) != 1 {
+		t.Fatalf("a concurrent settings change must survive and hooks must be installed:\n%s", b)
+	}
+}
+
+// TestMain keeps every test's edit lock out of the user's real data dir.
+func TestMain(m *testing.M) {
+	d, err := os.MkdirTemp("", "switcch-hooks-test")
+	if err != nil {
+		panic(err)
+	}
+	lockPath = func() string { return filepath.Join(d, "settings.lock") }
+	code := m.Run()
+	os.RemoveAll(d)
+	os.Exit(code)
 }
