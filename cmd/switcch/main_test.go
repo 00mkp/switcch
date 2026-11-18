@@ -182,3 +182,54 @@ func TestRouteLaunchForwardsClaudeArgs(t *testing.T) {
 		t.Fatalf("claudeArgs = %v, want [--resume]", cmd.claudeArgs)
 	}
 }
+
+func TestRouteLaunchFailoverFlags(t *testing.T) {
+	c, err := route([]string{"work", "--fallback", "other,personal", "--threshold", "80", "--trigger", "reactive", "--mode", "advisory", "--", "--resume"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.kind != "launch" || c.ref != "work" {
+		t.Fatalf("got %+v", c)
+	}
+	if len(c.fallback) != 2 || c.fallback[0] != "other" || c.fallback[1] != "personal" {
+		t.Fatalf("fallback override = %v", c.fallback)
+	}
+	if c.threshold != "80" || c.trigger != "reactive" || c.mode != "advisory" {
+		t.Fatalf("flags = %+v", c)
+	}
+	if len(c.claudeArgs) != 1 || c.claudeArgs[0] != "--resume" {
+		t.Fatalf("claudeArgs = %v", c.claudeArgs)
+	}
+	p, _ := route([]string{"work", "--pin", "--model", "opus"})
+	if !p.pin {
+		t.Fatal("--pin not parsed")
+	}
+	if len(p.claudeArgs) != 2 || p.claudeArgs[0] != "--model" {
+		t.Fatalf("unknown flags should pass through to claude, got %v", p.claudeArgs)
+	}
+	if _, err := route([]string{"work", "--threshold"}); err == nil {
+		t.Fatal("--threshold without a value must error")
+	}
+}
+
+func TestRouteFallbackAndConfig(t *testing.T) {
+	c, err := route([]string{"fallback", "work", "personal", "other"})
+	if err != nil || c.kind != "fallback" || c.ref != "work" || len(c.refs) != 2 || c.clear {
+		t.Fatalf("fallback set: %+v %v", c, err)
+	}
+	c, err = route([]string{"fallback", "work", "--clear"})
+	if err != nil || !c.clear {
+		t.Fatalf("fallback clear: %+v %v", c, err)
+	}
+	if _, err := route([]string{"fallback", "work"}); err == nil {
+		t.Fatal("fallback with no targets and no --clear must error")
+	}
+	c, err = route([]string{"config", "set", "threshold", "85"})
+	if err != nil || c.kind != "config-set" || c.key != "threshold" || c.value != "85" {
+		t.Fatalf("config set: %+v %v", c, err)
+	}
+	c, err = route([]string{"config", "show"})
+	if err != nil || c.kind != "config-show" {
+		t.Fatalf("config show: %+v %v", c, err)
+	}
+}

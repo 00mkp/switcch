@@ -94,11 +94,62 @@ func (s *Store) Remove(ref string) error {
 	out := s.Accounts[:0]
 	for _, x := range s.Accounts {
 		if x.Slot != a.Slot {
+			x.Fallback = withoutSlot(x.Fallback, a.Slot)
 			out = append(out, x)
 		}
 	}
 	s.Accounts = out
 	return nil
+}
+
+func withoutSlot(slots []int, drop int) []int {
+	var out []int
+	for _, s := range slots {
+		if s != drop {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// SetFallback sets ref's ordered fallback list (nil/empty clears it). Each entry
+// must resolve to a different registered account.
+func (s *Store) SetFallback(ref string, refs []string) error {
+	a, err := s.Resolve(ref)
+	if err != nil {
+		return err
+	}
+	var slots []int
+	for _, r := range refs {
+		f, err := s.Resolve(r)
+		if err != nil {
+			return fmt.Errorf("fallback %q: %w", r, err)
+		}
+		if f.Slot == a.Slot {
+			return fmt.Errorf("account %q cannot fall back to itself", ref)
+		}
+		slots = append(slots, f.Slot)
+	}
+	for i := range s.Accounts {
+		if s.Accounts[i].Slot == a.Slot {
+			s.Accounts[i].Fallback = slots
+		}
+	}
+	return nil
+}
+
+// Pool is the ordered account list a session on a uses: a, then a's own
+// fallback list (no transitive chaining; vanished slots are skipped).
+func (s *Store) Pool(a Account) []Account {
+	pool := []Account{a}
+	for _, slot := range a.Fallback {
+		for _, x := range s.Accounts {
+			if x.Slot == slot {
+				pool = append(pool, x)
+			}
+		}
+	}
+	return pool
 }
 
 // Save writes the state file atomically at mode 0600.

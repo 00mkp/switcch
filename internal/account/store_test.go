@@ -82,3 +82,82 @@ func TestRemove(t *testing.T) {
 		t.Fatalf("remove unknown: err = %v, want ErrNoAccount", err)
 	}
 }
+
+func TestFallbackPoolAndPin(t *testing.T) {
+	s := newTempStore(t)
+	p, _ := s.Add(Account{Email: "a@x.com", Alias: "personal"})
+	w, _ := s.Add(Account{Email: "b@y.com", Alias: "work"})
+
+	if err := s.SetFallback("work", []string{"personal"}); err != nil {
+		t.Fatal(err)
+	}
+	wa, _ := s.Resolve("work")
+	pool := s.Pool(wa)
+	if len(pool) != 2 || pool[0].Slot != w.Slot || pool[1].Slot != p.Slot {
+		t.Fatalf("work pool = %+v, want [work personal]", pool)
+	}
+	pa, _ := s.Resolve("personal")
+	if pp := s.Pool(pa); len(pp) != 1 || pp[0].Slot != p.Slot {
+		t.Fatalf("personal must be pinned, pool = %+v", pp)
+	}
+	// No transitive chaining: personal's own fallback does not extend work's pool.
+	o, _ := s.Add(Account{Email: "c@z.com", Alias: "other"})
+	if err := s.SetFallback("personal", []string{"other"}); err != nil {
+		t.Fatal(err)
+	}
+	wa, _ = s.Resolve("work")
+	if pool := s.Pool(wa); len(pool) != 2 {
+		t.Fatalf("pool must not chain transitively, got %+v (other=%d)", pool, o.Slot)
+	}
+}
+
+func TestFallbackValidation(t *testing.T) {
+	s := newTempStore(t)
+	s.Add(Account{Email: "a@x.com", Alias: "personal"})
+	s.Add(Account{Email: "b@y.com", Alias: "work"})
+	if err := s.SetFallback("work", []string{"work"}); err == nil {
+		t.Fatal("self-reference must error")
+	}
+	if err := s.SetFallback("work", []string{"nope"}); err == nil {
+		t.Fatal("unknown account must error")
+	}
+	if err := s.SetFallback("work", nil); err != nil { // clear
+		t.Fatal(err)
+	}
+}
+
+func TestRemoveStripsFromFallbacks(t *testing.T) {
+	s := newTempStore(t)
+	s.Add(Account{Email: "a@x.com", Alias: "personal"})
+	s.Add(Account{Email: "b@y.com", Alias: "work"})
+	_ = s.SetFallback("work", []string{"personal"})
+	if err := s.Remove("personal"); err != nil {
+		t.Fatal(err)
+	}
+	wa, _ := s.Resolve("work")
+	if len(wa.Fallback) != 0 {
+		t.Fatalf("removed account still in fallback: %v", wa.Fallback)
+	}
+}
+
+func TestFallbackSurvivesAliasRenameAndReload(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	s, _ := Load()
+	s.Add(Account{Email: "a@x.com", Alias: "personal"})
+	s.Add(Account{Email: "b@y.com", Alias: "work"})
+	_ = s.SetFallback("work", []string{"personal"})
+	for i := range s.Accounts { // rename personal -> home
+		if s.Accounts[i].Alias == "personal" {
+			s.Accounts[i].Alias = "home"
+		}
+	}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	s2, _ := Load()
+	wa, _ := s2.Resolve("work")
+	pool := s2.Pool(wa)
+	if len(pool) != 2 || pool[1].Alias != "home" {
+		t.Fatalf("fallback should follow the slot across rename+reload, pool = %+v", pool)
+	}
+}

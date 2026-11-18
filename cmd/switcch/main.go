@@ -16,6 +16,7 @@ import (
 
 	"github.com/00mkp/switcch/internal/account"
 	"github.com/00mkp/switcch/internal/capture"
+	"github.com/00mkp/switcch/internal/config"
 	"github.com/00mkp/switcch/internal/launch"
 	"github.com/00mkp/switcch/internal/oauth"
 	"github.com/00mkp/switcch/internal/session"
@@ -132,10 +133,66 @@ func friendlyLaunchError(ref string, err error) error {
 }
 
 type command struct {
-	kind       string // "add" | "list" | "remove" | "launch"
+	kind       string // "add" | "accounts" | "list" | "remove" | "status" | "help" | "launch" | "fallback" | "config-set" | "config-show"
 	ref        string
 	alias      string
 	claudeArgs []string
+
+	// launch failover overrides (empty = use account/config defaults)
+	pin       bool
+	fallback  []string
+	trigger   string
+	threshold string
+	mode      string
+
+	// fallback command
+	refs  []string
+	clear bool
+
+	// config set
+	key, value string
+}
+
+// parseLaunch splits `<account> [switcch flags] [-- claude args]`. switcch's own
+// flags are picked off; anything else (and everything after `--`) goes to claude.
+func parseLaunch(args []string) (command, error) {
+	c := command{kind: "launch", ref: args[0]}
+	rest := args[1:]
+	takeValue := func(i int, flag string) (string, error) {
+		if i+1 >= len(rest) {
+			return "", fmt.Errorf("%s needs a value", flag)
+		}
+		return rest[i+1], nil
+	}
+	for i := 0; i < len(rest); i++ {
+		a := rest[i]
+		switch a {
+		case "--":
+			c.claudeArgs = append(c.claudeArgs, rest[i+1:]...)
+			return c, nil
+		case "--pin":
+			c.pin = true
+		case "--fallback", "--threshold", "--trigger", "--mode":
+			v, err := takeValue(i, a)
+			if err != nil {
+				return command{}, err
+			}
+			switch a {
+			case "--fallback":
+				c.fallback = strings.Split(v, ",")
+			case "--threshold":
+				c.threshold = v
+			case "--trigger":
+				c.trigger = v
+			case "--mode":
+				c.mode = v
+			}
+			i++
+		default:
+			c.claudeArgs = append(c.claudeArgs, a)
+		}
+	}
+	return c, nil
 }
 
 // route classifies CLI args into a command without performing any side effects.
@@ -167,8 +224,32 @@ func route(args []string) (command, error) {
 		return command{kind: "status"}, nil
 	case "help", "-h", "--help":
 		return command{kind: "help"}, nil
+	case "fallback":
+		if len(args) < 2 {
+			return command{}, errors.New("usage: switcch fallback <account> <account>... | switcch fallback <account> --clear")
+		}
+		c := command{kind: "fallback", ref: args[1]}
+		for _, a := range args[2:] {
+			if a == "--clear" {
+				c.clear = true
+				continue
+			}
+			c.refs = append(c.refs, a)
+		}
+		if !c.clear && len(c.refs) == 0 {
+			return command{}, errors.New("usage: switcch fallback <account> <account>... | switcch fallback <account> --clear")
+		}
+		return c, nil
+	case "config":
+		if len(args) >= 2 && args[1] == "show" {
+			return command{kind: "config-show"}, nil
+		}
+		if len(args) == 4 && args[1] == "set" {
+			return command{kind: "config-set", key: args[2], value: args[3]}, nil
+		}
+		return command{}, errors.New("usage: switcch config show | switcch config set <key> <value>")
 	default:
-		return command{kind: "launch", ref: args[0], claudeArgs: args[1:]}, nil
+		return parseLaunch(args)
 	}
 }
 
@@ -182,7 +263,17 @@ Usage:
   switcch list                accounts with usage (5h/7d) and live sessions
   switcch status --json       machine-readable status
   switcch remove <account>    forget an account (deletes its stored credential)
-  switcch help                show this help`
+  switcch fallback <account> <account>...
+                              set where an account's sessions fail over to (once)
+  switcch fallback <account> --clear
+                              pin an account (no failover)
+  switcch config show | set <key> <value>
+                              trigger (proactive|reactive), threshold (1-100),
+                              mode (auto|advisory), notice, idleMigrateMinutes
+  switcch help                show this help
+
+Launch flags (override for one session):
+  --pin  --fallback a,b  --trigger T  --threshold N  --mode M   (-- passes the rest to claude)`
 
 // unknownRefError explains that a first argument matched neither a command nor a
 // registered account (e.g. a mistyped subcommand).
@@ -225,7 +316,19 @@ func run(args []string) error {
 			if a.Alias != "" {
 				label = " (" + a.Alias + ")"
 			}
-			fmt.Printf("  %d: %s%s\n", a.Slot, a.Email, label)
+			fb := ""
+			if pool := store.Pool(a); len(pool) > 1 {
+				var names []string
+				for _, f := range pool[1:] {
+					n := f.Alias
+					if n == "" {
+						n = f.Email
+					}
+					names = append(names, n)
+				}
+				fb = "  → fallback: " + strings.Join(names, ", ")
+			}
+			fmt.Printf("  %d: %s%s%s\n", a.Slot, a.Email, label, fb)
 		}
 		return nil
 	case "list":
@@ -264,6 +367,36 @@ func run(args []string) error {
 		return nil
 	case "help":
 		fmt.Println(usageText)
+		return nil
+	case "fallback":
+		if cmd.clear {
+			cmd.refs = nil
+		}
+		if err := store.SetFallback(cmd.ref, cmd.refs); err != nil {
+			return err
+		}
+		if err := store.Save(); err != nil {
+			return err
+		}
+		if cmd.clear {
+			fmt.Printf("%s is now pinned (no fallback)\n", cmd.ref)
+		} else {
+			fmt.Printf("%s now falls back to: %s\n", cmd.ref, strings.Join(cmd.refs, ", "))
+		}
+		return nil
+	case "config-set":
+		if err := config.Set(cmd.key, cmd.value); err != nil {
+			return err
+		}
+		fmt.Printf("%s = %s\n", cmd.key, cmd.value)
+		return nil
+	case "config-show":
+		c, err := config.Load()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("trigger            %s\nthreshold          %g%%\nmode               %s\nidleMigrateMinutes %d\nnotice             %s\n",
+			c.Trigger, c.Threshold, c.Mode, c.IdleMigrateMinutes, c.Notice)
 		return nil
 	case "launch":
 		a, err := store.Resolve(cmd.ref)

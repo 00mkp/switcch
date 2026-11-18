@@ -12,4 +12,7 @@ type Account struct {
 	DisplayName string `json:"displayName,omitempty"`
 	OrgName     string `json:"orgName,omitempty"`
 	Alias       string `json:"alias,omitempty"`
+	// Fallback is the ordered list of slots this account's sessions fail over
+	// to. Stored by slot so alias renames don't break it. Empty = pinned.
+	Fallback []int `json:"fallback,omitempty"`
 }
