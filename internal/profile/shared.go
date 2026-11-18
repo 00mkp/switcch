@@ -2,6 +2,7 @@ package profile
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,9 @@ import (
 var SharedItems = []string{
 	"settings.json", "keybindings.json", "CLAUDE.md",
 	"skills", "commands", "agents", "rules", "plugins",
+	// Shared transcripts (Phase 4): every account's resume picker sees every
+	// chat, which is what makes move/import and failover-resume work.
+	"projects", "history.jsonl",
 }
 
 // scrubKeys are auth-override env vars removed before launching a session; they
@@ -54,7 +58,14 @@ func SyncShared(profileDir, claudeHome string) error {
 			linked = append(linked, name)
 			continue
 		}
-		_ = os.Remove(dst)
+		// A pre-existing REAL entry (e.g. per-profile transcripts from before
+		// sharing) is merged into the shared target first — never lose a chat.
+		if dfi, err := os.Lstat(dst); err == nil && dfi.Mode()&os.ModeSymlink == 0 {
+			if err := mergeInto(dst, target); err != nil {
+				return fmt.Errorf("profile: merge %s into shared %s: %w", dst, target, err)
+			}
+		}
+		_ = os.RemoveAll(dst)
 		if err := os.Symlink(target, dst); err != nil {
 			return err
 		}
@@ -67,6 +78,63 @@ func SyncShared(profileDir, claudeHome string) error {
 		return err
 	}
 	return atomicWrite(filepath.Join(profileDir, ".switcch-shared.json"), man, 0o600)
+}
+
+// mergeInto moves src's contents into dst. Directories merge recursively (an
+// entry missing at dst is moved; on a file clash the newer mtime wins). A file
+// src is appended to dst (history.jsonl is line-oriented).
+func mergeInto(src, dst string) error {
+	sfi, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	if !sfi.IsDir() {
+		b, err := os.ReadFile(src)
+		if err != nil {
+			return err
+		}
+		f, err := os.OpenFile(dst, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = f.Write(b)
+		return err
+	}
+	if err := os.MkdirAll(dst, 0o700); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		s, d := filepath.Join(src, e.Name()), filepath.Join(dst, e.Name())
+		dfi, derr := os.Lstat(d)
+		switch {
+		case os.IsNotExist(derr):
+			if err := os.Rename(s, d); err != nil {
+				return err
+			}
+		case derr != nil:
+			return derr
+		case e.IsDir() && dfi.IsDir():
+			if err := mergeInto(s, d); err != nil {
+				return err
+			}
+		default:
+			sfi, err := e.Info()
+			if err != nil {
+				return err
+			}
+			if sfi.ModTime().After(dfi.ModTime()) {
+				if err := os.Rename(s, d); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // ScrubEnv returns env with the auth-override variables removed.

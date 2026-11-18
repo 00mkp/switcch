@@ -92,3 +92,43 @@ func mustWrite(t *testing.T, path, content string) {
 		t.Fatal(err)
 	}
 }
+
+// Converting a profile's real projects/ and history.jsonl into shared links must
+// merge their contents into ~/.claude first — never lose a chat.
+func TestSyncSharedMergesExistingTranscripts(t *testing.T) {
+	home := t.TempDir()
+	prof := t.TempDir()
+	// home side
+	if err := os.MkdirAll(filepath.Join(home, "projects", "-y"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(home, "projects", "-y", "def.jsonl"), "home-chat")
+	mustWrite(t, filepath.Join(home, "history.jsonl"), "h\n")
+	// profile side (pre-existing, real)
+	if err := os.MkdirAll(filepath.Join(prof, "projects", "-x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(prof, "projects", "-x", "abc.jsonl"), "profile-chat")
+	mustWrite(t, filepath.Join(prof, "history.jsonl"), "p\n")
+
+	if err := SyncShared(prof, home); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range []string{"projects", "history.jsonl"} {
+		got, err := os.Readlink(filepath.Join(prof, name))
+		if err != nil || got != filepath.Join(home, name) {
+			t.Fatalf("%s should be a link to home, got %q err %v", name, got, err)
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(home, "projects", "-x", "abc.jsonl")); err != nil || string(b) != "profile-chat" {
+		t.Fatalf("profile chat was not merged into home: %q %v", b, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(home, "projects", "-y", "def.jsonl")); string(b) != "home-chat" {
+		t.Fatal("existing home chat was disturbed")
+	}
+	hist, _ := os.ReadFile(filepath.Join(home, "history.jsonl"))
+	if !strings.Contains(string(hist), "h\n") || !strings.Contains(string(hist), "p\n") {
+		t.Fatalf("history not merged: %q", hist)
+	}
+}
