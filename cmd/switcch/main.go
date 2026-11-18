@@ -11,12 +11,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/00mkp/switcch/internal/account"
 	"github.com/00mkp/switcch/internal/capture"
 	"github.com/00mkp/switcch/internal/config"
+	"github.com/00mkp/switcch/internal/hooks"
 	"github.com/00mkp/switcch/internal/launch"
 	"github.com/00mkp/switcch/internal/oauth"
 	"github.com/00mkp/switcch/internal/session"
@@ -240,6 +242,10 @@ func route(args []string) (command, error) {
 			return command{}, errors.New("usage: switcch fallback <account> <account>... | switcch fallback <account> --clear")
 		}
 		return c, nil
+	case "setup":
+		return command{kind: "setup"}, nil
+	case "uninstall-hooks":
+		return command{kind: "uninstall-hooks"}, nil
 	case "config":
 		if len(args) >= 2 && args[1] == "show" {
 			return command{kind: "config-show"}, nil
@@ -267,6 +273,8 @@ Usage:
                               set where an account's sessions fail over to (once)
   switcch fallback <account> --clear
                               pin an account (no failover)
+  switcch setup               install switcch's hooks into ~/.claude/settings.json
+  switcch uninstall-hooks     remove exactly the hooks switcch installed
   switcch config show | set <key> <value>
                               trigger (proactive|reactive), threshold (1-100),
                               mode (auto|advisory), notice, idleMigrateMinutes
@@ -274,6 +282,23 @@ Usage:
 
 Launch flags (override for one session):
   --pin  --fallback a,b  --trigger T  --threshold N  --mode M   (-- passes the rest to claude)`
+
+// hookPaths returns the user's real ~/.claude/settings.json and the absolute
+// path of this switcch binary (what the installed hooks invoke).
+func hookPaths() (settings, exe string, err error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", err
+	}
+	exe, err = os.Executable()
+	if err != nil {
+		return "", "", err
+	}
+	if r, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = r
+	}
+	return filepath.Join(home, ".claude", "settings.json"), exe, nil
+}
 
 // unknownRefError explains that a first argument matched neither a command nor a
 // registered account (e.g. a mistyped subcommand).
@@ -383,6 +408,26 @@ func run(args []string) error {
 		} else {
 			fmt.Printf("%s now falls back to: %s\n", cmd.ref, strings.Join(cmd.refs, ", "))
 		}
+		return nil
+	case "setup":
+		p, exe, err := hookPaths()
+		if err != nil {
+			return err
+		}
+		if err := hooks.Install(p, exe); err != nil {
+			return err
+		}
+		fmt.Printf("Installed switcch hooks (%s) in %s\n", strings.Join(hooks.Events, ", "), p)
+		return nil
+	case "uninstall-hooks":
+		p, _, err := hookPaths()
+		if err != nil {
+			return err
+		}
+		if err := hooks.Uninstall(p); err != nil {
+			return err
+		}
+		fmt.Printf("Removed switcch hooks from %s\n", p)
 		return nil
 	case "config-set":
 		if err := config.Set(cmd.key, cmd.value); err != nil {

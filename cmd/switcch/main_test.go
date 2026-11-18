@@ -233,3 +233,12 @@ func TestRouteFallbackAndConfig(t *testing.T) {
 		t.Fatalf("config show: %+v %v", c, err)
 	}
 }
+
+func TestRouteSetupAndUninstallHooks(t *testing.T) {
+	if c, err := route([]string{"setup"}); err != nil || c.kind != "setup" {
+		t.Fatalf("setup: %+v %v", c, err)
+	}
+	if c, err := route([]string{"uninstall-hooks"}); err != nil || c.kind != "uninstall-hooks" {
+		t.Fatalf("uninstall-hooks: %+v %v", c, err)
+	}
+}
