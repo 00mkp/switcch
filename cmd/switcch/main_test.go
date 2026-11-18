@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"testing"
 
@@ -366,5 +367,23 @@ func TestConfigTextListsEveryKey(t *testing.T) {
 	}
 	if !strings.Contains(usageText, "waitForReset") || !strings.Contains(usageText, "eventCommand") {
 		t.Fatal("help must name the new settings")
+	}
+}
+
+func TestVersionString(t *testing.T) {
+	if v := versionString(nil, "v1.2.0"); v != "v1.2.0" {
+		t.Fatalf("ldflag wins: %q", v)
+	}
+	if v := versionString(&debug.BuildInfo{Main: debug.Module{Version: "v0.5.0"}}, ""); v != "v0.5.0" {
+		t.Fatalf("go install version: %q", v)
+	}
+	if v := versionString(&debug.BuildInfo{Main: debug.Module{Version: "(devel)"}}, ""); v != "dev" {
+		t.Fatalf("local build: %q", v)
+	}
+	if v := versionString(nil, ""); v != "dev" {
+		t.Fatalf("no info: %q", v)
+	}
+	if c, err := route([]string{"version"}); err != nil || c.kind != "version" {
+		t.Fatalf("route version: %+v %v", c, err)
 	}
 }

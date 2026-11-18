@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -251,6 +252,8 @@ func route(args []string) (command, error) {
 			return command{}, errors.New("usage: switcch fallback <account> <account>... | switcch fallback <account> --clear")
 		}
 		return c, nil
+	case "version":
+		return command{kind: "version"}, nil
 	case "setup":
 		return command{kind: "setup"}, nil
 	case "uninstall-hooks":
@@ -289,10 +292,26 @@ Usage:
                               mode (auto|advisory), idleMigrateMinutes,
                               waitForReset (true|false), modelFallback (a,b | ""),
                               eventCommand, notice, modelNotice, resumeMessage
+  switcch version             print the version
   switcch help                show this help
 
 Launch flags (override for one session):
   --pin  --fallback a,b  --trigger T  --threshold N  --mode M   (-- passes the rest to claude)`
+
+// version is set at build time: -ldflags "-X main.version=v1.0.0".
+var version string
+
+// versionString picks the build-time version, else the module version that
+// `go install …@vX` records, else "dev".
+func versionString(info *debug.BuildInfo, ldflag string) string {
+	if ldflag != "" {
+		return ldflag
+	}
+	if info != nil && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return "dev"
+}
 
 // configText renders `switcch config show`.
 func configText(c config.Config) string {
@@ -450,6 +469,10 @@ func run(args []string) error {
 		} else {
 			fmt.Printf("%s now falls back to: %s\n", cmd.ref, strings.Join(cmd.refs, ", "))
 		}
+		return nil
+	case "version":
+		info, _ := debug.ReadBuildInfo()
+		fmt.Println("switcch " + versionString(info, version))
 		return nil
 	case "setup":
 		p, exe, err := hookPaths()
