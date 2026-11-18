@@ -8,7 +8,8 @@
 - **Shared transcripts.** `projects/` and `history.jsonl` join the shared set, so every profile sees every chat. That alone makes `switcch <account> -- --resume` a working *move* and *import* (plain-`claude` chats live in `~/.claude/projects`, which profiles now link to).
 - **Failover = relaunch under the next account's profile.** No per-session profiles: each account keeps its Phase 1 profile; switching a chat means exiting Claude and running `claude --resume <session-id> "<notice>"` with the next account's `CLAUDE_CONFIG_DIR`. Cross-account resume is validated (spike, 2026-11-11).
 - **Supervisor instead of `exec`.** `switcch <pool>` stays alive as Claude's parent (inherited stdio, no PTY), so it can relaunch. Ctrl-C reaches Claude; switcch ignores it while a child runs.
-- **Detection via Claude Code hooks.** switcch installs `Stop` and `StopFailure` command hooks in `~/.claude/settings.json` (by signature, removable). Each runs `switcch __hook <event>`, which is a no-op unless the session was launched by switcch (`SWITCCH_SIGNAL_DIR` set). The hook classifies the payload (conservative, ported from cux's rules) and writes a signal file the supervisor polls.
+- **Detection via Claude Code hooks.** switcch installs `UserPromptSubmit`, `Stop` and `StopFailure` command hooks in `~/.claude/settings.json` (by signature, removable). Each runs `switcch __hook <event>`, which is a no-op unless the session was launched by switcch (`SWITCCH_SIGNAL_DIR` set). The hook classifies the payload (conservative, ported from cux's rules) and writes a signal file the supervisor polls.
+- **Idle chats switch on your next message (decided with the user 2026-11-17).** An idle chat spends nothing, so it is not restarted when its account crosses the line. Instead, the supervisor writes an `armed` marker; when you next send a message, the `UserPromptSubmit` hook sees it, records your prompt, and **blocks** it (exit 2) so it never reaches the over-limit account. The supervisor restarts the chat on the next account with `--resume <sid>` and your prompt (notice line prepended) as the first message — no failed turn, nothing lost. Optional `idleMigrateMinutes` (default `0` = off) also moves chats idle that long; off by default because restarting at the prompt can wipe half-typed input.
 - **Notice in the chat.** The relaunch passes a first prompt (e.g. `[switcch] work hit its usage limit — continuing on personal.`), which is both the visible notice and the "keep going".
 
 **Tech Stack:** Go; Phase 1–3 packages (`profile`, `launch`, `credsync`, `usage`, `session`, `account`).
@@ -23,7 +24,9 @@
   - `threshold`: **`90`** (% of the 5h or 7d window, whichever is higher); any value 1–100. Flag: `--threshold N`. Ignored when `trigger` is `reactive`.
   - `mode`: `auto` (default — actually switch) or `advisory` (notify only, never switch). Flag: `--mode`.
   - A hard limit always triggers a switch in `auto` mode, whatever `trigger` is.
-  - `notice`: the in-chat notice text above.
+  - `notice`: the in-chat notice text above (`switcch config set notice "..."`). On an intercepted message it is prepended as its own line above your prompt; on a turn-end/hard-limit switch it is the whole first message.
+  - `idleMigrateMinutes`: `0` (off).
+- The `UserPromptSubmit` hook runs on every prompt in switcch sessions: when not `armed` it must exit 0 immediately (one stat of the marker file — no network, no keychain).
 - Hooks are installed into the user's real `~/.claude/settings.json` (shared into every profile). Preserve all other keys and hooks; tag switcch's entries so `switcch uninstall-hooks` removes exactly them. Outside a switcch session the hook must exit 0 and do nothing.
 - Classifier must be conservative (a false positive restarts a healthy session): match only the strong limit phrases and `rate_limit` on `StopFailure`; reject foreign-content markers and the context/token-limit denylist (tech-discovery §1).
 - Unset `CLAUDE_CODE_RETRY_WATCHDOG` in the child env (it can suppress `StopFailure`).
@@ -42,6 +45,8 @@ Model-cap fallback (try another model before switching accounts), opt-in wait-fo
 - **No viable next account** (all in pool exhausted, or the pool is a pin): supervisor must not loop relaunching. → Task 5.
 - **Ctrl-C / normal exit**: the user quitting Claude must end switcch too, not trigger a relaunch. → Task 5.
 - **Settings.json corruption**: install/uninstall must round-trip a settings file with unrelated hooks and keys untouched. → Task 3.
+- **Prompt intercept when not armed**: the user's message must pass through untouched (exit 0, no output). Blocking a prompt wrongly would eat the user's message. → Task 4.
+- **Intercepted prompt fidelity**: a multi-line prompt with quotes/unicode must reach the next account byte-for-byte (plus only the notice line). → Task 5.
 
 ---
 
@@ -72,7 +77,7 @@ Model-cap fallback (try another model before switching accounts), opt-in wait-fo
 
 **Files:** Create `internal/hooks/install.go` (+ test); Modify `cmd/switcch/main.go` (`setup`, `uninstall-hooks`)
 
-**Interfaces:** `Install(settingsPath string, exe string) error` adds `Stop` and `StopFailure` entries `{matcher:".*", hooks:[{type:"command", command:"<exe> __hook <event>", timeout:5}]}` tagged by the command prefix; idempotent. `Uninstall(settingsPath string) error` removes only tagged entries. Launch calls `Install` (idempotent) before starting.
+**Interfaces:** `Install(settingsPath string, exe string) error` adds `UserPromptSubmit`, `Stop` and `StopFailure` entries `{matcher:".*", hooks:[{type:"command", command:"<exe> __hook <event>", timeout:5}]}` tagged by the command prefix; idempotent. `Uninstall(settingsPath string) error` removes only tagged entries. Launch calls `Install` (idempotent) before starting.
 
 - [ ] **Step 1: failing test** — settings with an unrelated `PreToolUse` hook and an unrelated top-level key: `Install` twice ⇒ exactly one switcch entry per event, unrelated content byte-equivalent after JSON round-trip; `Uninstall` ⇒ back to the original structure.
 - [ ] **Step 2–4:** implement (atomic write; resolve a symlinked settings.json to its target, as `SyncShared` does) + verify.
@@ -82,9 +87,9 @@ Model-cap fallback (try another model before switching accounts), opt-in wait-fo
 
 **Files:** Create `internal/hooks/classify.go`, `internal/hooks/signal.go` (+ tests); Modify `cmd/switcch/main.go`
 
-**Interfaces:** `Classify(event string, payload []byte) Signal` returning `None | RateLimited | Stopped`, carrying `SessionID`. `WriteSignal(dir string, s Signal) error` writes `<dir>/<kind>` atomically with the session id. `__hook <event>` reads stdin; if `SWITCCH_SIGNAL_DIR` is unset ⇒ exit 0 with no output.
+**Interfaces:** `Classify(event string, payload []byte) Signal` returning `None | RateLimited | Stopped | PromptSubmitted`, carrying `SessionID` (and `Prompt` for `UserPromptSubmit`). `WriteSignal(dir string, s Signal) error` writes `<dir>/<kind>` atomically. `HandleHook(event string, stdin io.Reader, env) (exitCode int, stderr string)`: if `SWITCCH_SIGNAL_DIR` is unset ⇒ `0, ""`. For `UserPromptSubmit`: not `armed` ⇒ write a `busy` marker, return `0`; `armed` ⇒ write an `intercept` signal with session id + prompt, return `2` with stderr `switcch: moving this chat to <next>…`. `__hook <event>` calls it and exits with its code.
 
-- [ ] **Step 1: failing test** — table (ported from cux fixtures): `StopFailure` `error:"rate_limit"` ⇒ RateLimited; `last_assistant_message:"You've hit your session limit · resets 7pm"` with `error:"error"` ⇒ RateLimited; `error:"overloaded"` alone ⇒ None; "context window exceeded" ⇒ None; text containing `<html` + "rate limit" ⇒ None; `Stop` ⇒ Stopped; every result carries the payload `session_id`. Env unset ⇒ nothing written.
+- [ ] **Step 1: failing test** — table (ported from cux fixtures): `StopFailure` `error:"rate_limit"` ⇒ RateLimited; `last_assistant_message:"You've hit your session limit · resets 7pm"` with `error:"error"` ⇒ RateLimited; `error:"overloaded"` alone ⇒ None; "context window exceeded" ⇒ None; text containing `<html` + "rate limit" ⇒ None; `Stop` ⇒ Stopped; every result carries the payload `session_id`. `HandleHook`: env unset ⇒ 0 and nothing written; `UserPromptSubmit` not armed ⇒ 0, no intercept signal; armed ⇒ 2 and an `intercept` signal holding the exact prompt.
 - [ ] **Step 2–4:** implement + verify.
 - [ ] **Step 5: commit** — `feat(hooks): conservative limit classifier + signal files`.
 
@@ -94,7 +99,9 @@ Model-cap fallback (try another model before switching accounts), opt-in wait-fo
 
 **Interfaces:** `Run(ctx, pool []account.Account, opts Options) error` loop: `launch.Prepare(active)` ⇒ start `claude` as a child (inherited stdio, env + `SWITCCH_SIGNAL_DIR=<per-supervisor dir>`, watchdog unset) ⇒ poll the signal dir every 100ms ⇒ on `RateLimited`: SIGTERM the child, wait (≤5s, then SIGKILL), choose the next account via `next(pool, active, usageOf)` (skips accounts at/over limit; `nil` ⇒ no switch), update the session registry, relaunch with `--resume <sid> "<notice>"`. Child exits with no pending signal ⇒ capture-back (`credsync.Current`) and return. Pure `next(...)` and a `decide(signal, state) action` function hold the logic.
 
-- [ ] **Step 1: failing tests** — `next` skips an exhausted account and returns nil for a pin; `decide` maps RateLimited+target ⇒ Switch, RateLimited+no target ⇒ Stay, plain exit ⇒ Done. Integration: a fake `claude` (test helper binary placed first on `PATH`) that records its argv/env and blocks until SIGTERM; write a `rate-limited` signal ⇒ assert the second launch got `--resume <sid>`, the notice prompt, and the next account's `CLAUDE_CONFIG_DIR`.
+An `intercept` signal ⇒ SIGTERM the child and relaunch on the next account with `--resume <sid>` and first message = notice line + `\n\n` + the intercepted prompt verbatim.
+
+- [ ] **Step 1: failing tests** — `next` skips an exhausted account and returns nil for a pin; `decide` maps RateLimited+target ⇒ Switch, RateLimited+no target ⇒ Stay, Intercept+target ⇒ SwitchWithPrompt, plain exit ⇒ Done. Integration (fake `claude`): an `intercept` signal with a multi-line prompt containing quotes and unicode ⇒ the relaunch's last argv element is exactly `notice + "\n\n" + prompt`. Integration: a fake `claude` (test helper binary placed first on `PATH`) that records its argv/env and blocks until SIGTERM; write a `rate-limited` signal ⇒ assert the second launch got `--resume <sid>`, the notice prompt, and the next account's `CLAUDE_CONFIG_DIR`.
 - [ ] **Step 2–4:** implement + verify. Session registry records the supervisor pid with the current slot and updates it on switch.
 - [ ] **Step 5: commit** — `feat(supervise): reactive same-conversation failover`.
 
@@ -102,14 +109,15 @@ Model-cap fallback (try another model before switching accounts), opt-in wait-fo
 
 **Files:** Modify `internal/supervise/supervise.go` (+ tests)
 
-**Interfaces:** When `trigger` is `proactive`, poll `usage.Cached(active)` every 60s while running; if max(5h, 7d) ≥ threshold: `auto` ⇒ arm a switch and perform it on the next `Stopped` signal (turn end, so no turn is cut off); `advisory` ⇒ post one macOS notification (`osascript -e 'display notification ...'`, seam for tests) and never switch. When `trigger` is `reactive`, skip polling entirely (only the hard-limit path from Task 5 applies).
+**Interfaces:** When `trigger` is `proactive`, poll `usage.Cached(active)` every 60s while running; if max(5h, 7d) ≥ threshold: `auto` ⇒ write the `armed` marker; if a turn is in progress (`busy` since the last `Stopped`), switch on the next `Stopped` (turn end, so no turn is cut off); if idle, do nothing until the next prompt (the Task 4 intercept switches it) — or, when `idleMigrateMinutes` > 0 and the chat has been idle that long, switch it then; `advisory` ⇒ post one macOS notification (`osascript -e 'display notification ...'`, seam for tests) and never switch. When `trigger` is `reactive`, skip polling entirely (only the hard-limit path from Task 5 applies).
 
-- [ ] **Step 1: failing test** — stubbed usage at 91%, threshold 90: proactive+auto+`Stopped` ⇒ Switch; proactive+auto with no `Stopped` yet ⇒ no switch; proactive+advisory ⇒ one notification, no switch; reactive ⇒ usage is never polled and no switch at 91%.
+- [ ] **Step 1: failing test** — stubbed usage at 91%, threshold 90: proactive+auto+`Stopped` ⇒ Switch; proactive+auto with no `Stopped` yet ⇒ no switch; proactive+advisory ⇒ one notification, no switch; reactive ⇒ usage is never polled and no switch at 91%. Idle at 91% ⇒ `armed` written, no restart; idle with `idleMigrateMinutes=5` after 6 min ⇒ Switch. A hard limit also writes `armed` (so other idle chats on that account intercept on their next prompt).
 - [ ] **Step 2–4:** implement + verify.
 - [ ] **Step 5: commit** — `feat(supervise): proactive threshold switch and advisory notices`.
 
 ### Task 7: Manual verification (real accounts)
 
 - [ ] `switcch setup`; `switcch fallback work personal`; open a chat with `switcch work --threshold 1` (forces a proactive switch at the first turn end). Confirm the next turn continues the same conversation on personal and the notice appears in the chat; `switcch list` shows the session under personal.
+- [ ] Idle intercept: open a second `switcch work --threshold 1` chat, leave it idle until the first one has switched, then send a message. Confirm it does NOT run on work: the chat restarts on personal and your exact message is answered there. (Also confirms Claude Code honours exit-code-2 prompt blocking.)
 - [ ] Exit a chat, then `switcch personal -- --resume` and pick a chat started with plain `claude` — it resumes under personal (import).
 - [ ] `switcch uninstall-hooks` leaves `~/.claude/settings.json` otherwise unchanged.
