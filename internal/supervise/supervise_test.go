@@ -21,6 +21,7 @@ import (
 
 	"github.com/00mkp/switcch/internal/account"
 	"github.com/00mkp/switcch/internal/config"
+	"github.com/00mkp/switcch/internal/event"
 	"github.com/00mkp/switcch/internal/hooks"
 	"github.com/00mkp/switcch/internal/session"
 	"github.com/00mkp/switcch/internal/usage"
@@ -59,15 +60,15 @@ func TestNextSkipsExhaustedAndPins(t *testing.T) {
 
 func TestDecide(t *testing.T) {
 	cases := []struct {
-		ev   event
+		ev   hookEvent
 		want action
 	}{
-		{event{kind: hooks.RateLimited, hasTarget: true, mode: "auto"}, switchAcct},
-		{event{kind: hooks.RateLimited, hasTarget: false, mode: "auto"}, stay},
-		{event{kind: hooks.RateLimited, hasTarget: true, mode: "advisory"}, stay},
-		{event{kind: hooks.RateLimited, hasTarget: true, mode: ""}, switchAcct}, // one predicate for "auto"
-		{event{kind: hooks.Intercept, hasTarget: true, mode: "auto"}, switchWithPrompt},
-		{event{exited: true}, done},
+		{hookEvent{kind: hooks.RateLimited, hasTarget: true, mode: "auto"}, switchAcct},
+		{hookEvent{kind: hooks.RateLimited, hasTarget: false, mode: "auto"}, stay},
+		{hookEvent{kind: hooks.RateLimited, hasTarget: true, mode: "advisory"}, stay},
+		{hookEvent{kind: hooks.RateLimited, hasTarget: true, mode: ""}, switchAcct}, // one predicate for "auto"
+		{hookEvent{kind: hooks.Intercept, hasTarget: true, mode: "auto"}, switchWithPrompt},
+		{hookEvent{exited: true}, done},
 	}
 	for _, c := range cases {
 		if got := decide(c.ev); got != c.want {
@@ -478,6 +479,15 @@ func scripted(t *testing.T, cfg config.Config, pool []account.Account, util map[
 	clock = func() time.Time { return start.Add(time.Since(start) * 1000) }
 
 	go func() {
+		// Time steps from when the first Claude is actually running (its pid
+		// is recorded), not from Run's start: under load, starting the fake
+		// can take long enough that it would exit before a step fires.
+		for i := 0; i < 500; i++ {
+			if m, _ := filepath.Glob(filepath.Join(root, "sess-*", hooks.ChildPIDFile)); len(m) > 0 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 		for _, s := range steps {
 			time.Sleep(s.after)
 			dirs, _ := filepath.Glob(filepath.Join(root, "sess-*"))
@@ -622,7 +632,10 @@ func TestPromptSubmittedDuringSwitchIsNotLost(t *testing.T) {
 			stopped(d)
 			_ = hooks.WriteSignal(d, hooks.Signal{Kind: hooks.Intercept, SessionID: "sid-1", Prompt: "late msg"})
 		}}})
-	if _, msg, ok := resumeOf(l[1].Args); len(l) != 2 || !ok || !strings.HasSuffix(msg, "\n\nlate msg") {
+	if len(l) != 2 {
+		t.Fatalf("want 2 launches, got %d", len(l))
+	}
+	if _, msg, ok := resumeOf(l[1].Args); !ok || !strings.HasSuffix(msg, "\n\nlate msg") {
 		t.Fatalf("late prompt must be delivered on the new account, got %+v", l)
 	}
 }
@@ -677,5 +690,29 @@ func TestSupervisorRecordsSession(t *testing.T) {
 	last := recs[len(recs)-1]
 	if last.PID != os.Getpid() || last.SessionID != "sid-1" || !slices.Equal(last.Pool, []int{1, 2}) || !last.Started.Equal(recs[0].Started) {
 		t.Fatalf("record = %+v (first %+v)", last, recs[0])
+	}
+}
+
+func TestRunEmitsLimitAndExhaustion(t *testing.T) {
+	var mu sync.Mutex
+	var evs []event.Event
+	o := emitEvent
+	t.Cleanup(func() { emitEvent = o })
+	emitEvent = func(cmd string, e event.Event) { mu.Lock(); evs = append(evs, e); mu.Unlock() }
+	if _, _, err := runFakeErr(t, fake{act: "ratelimit-always", pool: []account.Account{work, personal}}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	var got []string
+	for _, e := range evs {
+		got = append(got, e.Reason+"/"+e.Account)
+		if e.SessionID != "sid-1" || e.Timestamp.IsZero() {
+			t.Fatalf("event %+v", e)
+		}
+	}
+	want := []string{"limit_hit/w@x.com", "limit_hit/p@x.com", "pool_exhausted/p@x.com"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("events = %v, want %v", got, want)
 	}
 }

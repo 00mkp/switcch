@@ -286,11 +286,27 @@ Usage:
   switcch uninstall-hooks     remove exactly the hooks switcch installed
   switcch config show | set <key> <value>
                               trigger (proactive|reactive), threshold (1-100),
-                              mode (auto|advisory), notice, idleMigrateMinutes
+                              mode (auto|advisory), idleMigrateMinutes,
+                              waitForReset (true|false), modelFallback (a,b | ""),
+                              eventCommand, notice, modelNotice, resumeMessage
   switcch help                show this help
 
 Launch flags (override for one session):
   --pin  --fallback a,b  --trigger T  --threshold N  --mode M   (-- passes the rest to claude)`
+
+// configText renders `switcch config show`.
+func configText(c config.Config) string {
+	ev := c.EventCommand
+	if ev == "" {
+		ev = "(off)"
+	}
+	mf := strings.Join(c.ModelFallback, ",")
+	if mf == "" {
+		mf = "(off)"
+	}
+	return fmt.Sprintf("trigger            %s\nthreshold          %g%%\nmode               %s\nidleMigrateMinutes %d\nwaitForReset       %t\nmodelFallback      %s\neventCommand       %s\nnotice             %s\nmodelNotice        %s\nresumeMessage      %s\n",
+		c.Trigger, c.Threshold, c.Mode, c.IdleMigrateMinutes, c.WaitForReset, mf, ev, c.Notice, c.ModelNotice, c.ResumeMessage)
+}
 
 // hookPaths returns the user's real ~/.claude/settings.json and the absolute
 // path of this switcch binary (what the installed hooks invoke).
@@ -466,8 +482,7 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("trigger            %s\nthreshold          %g%%\nmode               %s\nidleMigrateMinutes %d\nnotice             %s\n",
-			c.Trigger, c.Threshold, c.Mode, c.IdleMigrateMinutes, c.Notice)
+		fmt.Print(configText(c))
 		return nil
 	case "launch":
 		a, err := store.Resolve(cmd.ref)

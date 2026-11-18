@@ -25,6 +25,7 @@ import (
 	"github.com/00mkp/switcch/internal/account"
 	"github.com/00mkp/switcch/internal/config"
 	"github.com/00mkp/switcch/internal/credsync"
+	"github.com/00mkp/switcch/internal/event"
 	"github.com/00mkp/switcch/internal/hooks"
 	"github.com/00mkp/switcch/internal/launch"
 	"github.com/00mkp/switcch/internal/session"
@@ -57,6 +58,7 @@ var (
 	claudeHelp              = runHelp
 	childrenOf              = pgrepChildren
 	recordSession           = session.Record
+	emitEvent               = event.Emit
 	pollInterval            = 100 * time.Millisecond
 	killGrace               = 5 * time.Second
 	stderr        io.Writer = os.Stderr
@@ -154,14 +156,14 @@ const (
 	done
 )
 
-type event struct {
+type hookEvent struct {
 	kind      hooks.Kind
 	exited    bool
 	hasTarget bool
 	mode      string
 }
 
-func decide(e event) action {
+func decide(e hookEvent) action {
 	switch {
 	case e.exited:
 		return done
@@ -293,6 +295,7 @@ type move struct {
 	limit     float64 // replacement targets must be under this line
 	prompt    string  // intercepted user message(s), sent verbatim
 	hasPrompt bool
+	hard      bool // caused by a hard limit (no target left ⇒ pool exhausted)
 }
 
 // record writes this chat to the session registry (best-effort) when its
@@ -307,6 +310,10 @@ func (c *chat) record() {
 	}
 	_ = recordSession(session.Session{Slot: c.active.Slot, PID: os.Getpid(), Cwd: c.cwd, Started: c.started, SessionID: c.sid, Pool: pool})
 	c.recordedFor, c.recordedSid = c.active.Slot, c.sid
+}
+
+func (c *chat) emit(reason string, a account.Account) {
+	emitEvent(c.o.Config.EventCommand, event.Event{SessionID: c.sid, Account: a.Email, Reason: reason, Timestamp: time.Now()})
 }
 
 func (c *chat) skip(a account.Account) bool {
@@ -383,7 +390,7 @@ func (c *chat) tick() *move {
 		c.sid = cmp.Or(s.SessionID, c.sid)
 		lim := cmp.Or(c.armedLim, 100)
 		tgt := c.next(lim)
-		if decide(event{kind: hooks.Intercept, hasTarget: tgt != nil, mode: cfg.Mode}) == switchWithPrompt {
+		if decide(hookEvent{kind: hooks.Intercept, hasTarget: tgt != nil, mode: cfg.Mode}) == switchWithPrompt {
 			m := &move{to: c.active, limit: lim, prompt: s.Prompt, hasPrompt: true}
 			if tgt != nil {
 				m.to = *tgt
@@ -395,9 +402,13 @@ func (c *chat) tick() *move {
 	if s, ok := take(c.sigDir, hooks.RateLimited); ok {
 		c.sid = cmp.Or(s.SessionID, c.sid)
 		markLimited(c.mroot, c.active)
+		c.emit(event.LimitHit, c.active)
 		tgt := c.next(100)
-		if decide(event{kind: hooks.RateLimited, hasTarget: tgt != nil, mode: cfg.Mode}) == switchAcct {
-			return &move{to: *tgt, limit: 100}
+		if decide(hookEvent{kind: hooks.RateLimited, hasTarget: tgt != nil, mode: cfg.Mode}) == switchAcct {
+			return &move{to: *tgt, limit: 100, hard: true}
+		}
+		if tgt == nil {
+			c.emit(event.PoolExhausted, c.active)
 		}
 		if !auto {
 			c.advise(name(c.active) + " hit its usage limit")
@@ -479,6 +490,9 @@ func (c *chat) commit(m *move) ([]string, bool) {
 		}
 		if !m.hasPrompt {
 			c.disarm()
+			if m.hard {
+				c.emit(event.PoolExhausted, c.active)
+			}
 			return nil, false
 		}
 		m.to = c.active

@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/00mkp/switcch/internal/account"
+	"github.com/00mkp/switcch/internal/config"
 	"github.com/00mkp/switcch/internal/oauth"
 	"github.com/00mkp/switcch/internal/session"
 	"github.com/00mkp/switcch/internal/usage"
@@ -351,5 +352,19 @@ func TestStatusJSONSchema(t *testing.T) {
 	s := a1["sessions"].([]any)[0].(map[string]any)
 	if s["sessionId"] != "sid-7" || len(s["pool"].([]any)) != 2 {
 		t.Fatalf("session must carry sessionId and pool even when usage failed: %v", s)
+	}
+}
+
+func TestConfigTextListsEveryKey(t *testing.T) {
+	c := config.Defaults()
+	c.EventCommand = "cat >> /tmp/e"
+	out := configText(c)
+	for _, k := range []string{"trigger", "threshold", "mode", "idleMigrateMinutes", "notice", "eventCommand", "waitForReset", "modelFallback", "modelNotice", "resumeMessage", "cat >> /tmp/e", "sonnet"} {
+		if !strings.Contains(out, k) {
+			t.Fatalf("config show is missing %q:\n%s", k, out)
+		}
+	}
+	if !strings.Contains(usageText, "waitForReset") || !strings.Contains(usageText, "eventCommand") {
+		t.Fatal("help must name the new settings")
 	}
 }
