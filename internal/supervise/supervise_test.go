@@ -647,3 +647,14 @@ func TestTurnEndSwitchWaitsForBackgroundWork(t *testing.T) {
 		t.Fatalf("the chat must stay armed for its next prompt, armed=%q", armed)
 	}
 }
+
+func TestExitErrSignal(t *testing.T) {
+	err := exec.Command("sh", "-c", "kill -TERM $$").Run()
+	var ee *ExitError
+	if !errors.As(exitErr(err), &ee) || ee.Code != 143 {
+		t.Fatalf("a child killed by SIGTERM must exit 143, got %v", exitErr(err))
+	}
+	if exitErr(exec.Command("true").Run()) != nil {
+		t.Fatal("clean exit must be nil")
+	}
+}

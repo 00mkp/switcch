@@ -225,6 +225,9 @@ func signalDir(root string) (dir, resolvedRoot string, err error) {
 func exitErr(err error) error {
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
+		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			return &ExitError{Code: 128 + int(ws.Signal())} // shell convention
+		}
 		if c := ee.ExitCode(); c > 0 {
 			return &ExitError{Code: c}
 		}
@@ -529,6 +532,9 @@ func Run(ctx context.Context, o Options) error {
 				_ = cmd.Process.Signal(s)
 				<-exited
 				captureBack(c.active)
+				if sig, ok := s.(syscall.Signal); ok {
+					return &ExitError{Code: 128 + int(sig)}
+				}
 				return nil
 			case <-ctx.Done():
 				stopChild(cmd, exited)

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -294,10 +295,27 @@ func hookPaths() (settings, exe string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	if r, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = r
+	return filepath.Join(home, ".claude", "settings.json"), hookExe(exe, exec.LookPath), nil
+}
+
+// hookExe is the path the hooks invoke. It prefers the `switcch` found on PATH
+// when that is this same binary (e.g. /opt/homebrew/bin/switcch → Cellar/…),
+// because a resolved, versioned path disappears on upgrade; otherwise it is
+// os.Executable() as-is (never symlink-resolved, for the same reason).
+func hookExe(exe string, lookPath func(string) (string, error)) string {
+	p, err := lookPath("switcch")
+	if err != nil {
+		return exe
 	}
-	return filepath.Join(home, ".claude", "settings.json"), exe, nil
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	a, err1 := os.Stat(p)
+	b, err2 := os.Stat(exe)
+	if err1 == nil && err2 == nil && os.SameFile(a, b) {
+		return p
+	}
+	return exe
 }
 
 // unknownRefError explains that a first argument matched neither a command nor a

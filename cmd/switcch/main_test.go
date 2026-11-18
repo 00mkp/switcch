@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -284,5 +286,32 @@ func TestEffectiveConfigAppliesFlagOverrides(t *testing.T) {
 	}
 	if _, err := effectiveConfig(command{threshold: "500"}); err == nil {
 		t.Fatal("invalid --threshold must error")
+	}
+}
+
+func TestHookExePrefersStablePathEntry(t *testing.T) {
+	d := t.TempDir()
+	cellar := filepath.Join(d, "cellar", "1.0", "switcch")
+	bin := filepath.Join(d, "bin", "switcch")
+	other := filepath.Join(d, "other", "switcch")
+	for _, p := range []string{cellar, other} {
+		_ = os.MkdirAll(filepath.Dir(p), 0o755)
+		_ = os.WriteFile(p, []byte(p), 0o755)
+	}
+	_ = os.MkdirAll(filepath.Dir(bin), 0o755)
+	if err := os.Symlink(cellar, bin); err != nil {
+		t.Fatal(err)
+	}
+	look := func(p string) func(string) (string, error) {
+		return func(string) (string, error) { return p, nil }
+	}
+	if got := hookExe(cellar, look(bin)); got != bin {
+		t.Fatalf("PATH entry resolving to this binary should win: %q", got)
+	}
+	if got := hookExe(cellar, look(other)); got != cellar {
+		t.Fatalf("an unrelated PATH switcch must not be used: %q", got)
+	}
+	if got := hookExe(bin, func(string) (string, error) { return "", errors.New("nope") }); got != bin {
+		t.Fatalf("without a PATH match the exe is used unresolved: %q", got)
 	}
 }
