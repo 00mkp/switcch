@@ -27,7 +27,7 @@ func TestStatusJSON(t *testing.T) {
 			Models:   []usage.ModelCap{{Model: "Fable", Percent: 100, Active: true}},
 		}, nil
 	}
-	b, err := statusJSON(accts, sessions, usageOf)
+	b, err := statusJSON(accts, sessions, usageOf, func(account.Account) bool { return false })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,5 +313,43 @@ func TestHookExePrefersStablePathEntry(t *testing.T) {
 	}
 	if got := hookExe(bin, func(string) (string, error) { return "", errors.New("nope") }); got != bin {
 		t.Fatalf("without a PATH match the exe is used unresolved: %q", got)
+	}
+}
+
+func TestStatusJSONSchema(t *testing.T) {
+	accts := []account.Account{{Slot: 1, Email: "w@x.com", Alias: "work"}, {Slot: 2, Email: "p@x.com"}}
+	sessions := []session.Session{{Slot: 2, PID: 7, Cwd: "/c", SessionID: "sid-7", Pool: []int{2, 1}}}
+	usageOf := func(a account.Account) (usage.Usage, error) {
+		if a.Slot == 2 {
+			return usage.Usage{}, errors.New("401")
+		}
+		return usage.Usage{FiveHour: usage.Window{Utilization: 42}}, nil
+	}
+	limited := func(a account.Account) bool { return a.Slot == 1 }
+	b, err := statusJSON(accts, sessions, usageOf, limited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["schema"] != float64(1) {
+		t.Fatalf("schema = %v", m["schema"])
+	}
+	accs := m["accounts"].([]any)
+	a0, a1 := accs[0].(map[string]any), accs[1].(map[string]any)
+	if a0["limited"] != true || a1["limited"] != false {
+		t.Fatalf("limited flags: %v %v", a0["limited"], a1["limited"])
+	}
+	if s, ok := a0["sessions"].([]any); !ok || len(s) != 0 {
+		t.Fatalf("an account with no sessions must have sessions: [], got %#v", a0["sessions"])
+	}
+	if a1["usageError"] == nil {
+		t.Fatal("usage failure must be reported")
+	}
+	s := a1["sessions"].([]any)[0].(map[string]any)
+	if s["sessionId"] != "sid-7" || len(s["pool"].([]any)) != 2 {
+		t.Fatalf("session must carry sessionId and pool even when usage failed: %v", s)
 	}
 }

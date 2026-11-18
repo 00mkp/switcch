@@ -11,13 +11,17 @@ import (
 	"time"
 )
 
-// Session is one recorded launch. The PID is switcch's own pid at launch, which
-// becomes the `claude` process after exec.
+// Session is one supervised chat. PID is the switcch supervisor's pid; Slot is
+// the account it is on right now; Pool its configured failover order (as
+// launched; unchanged by switches);
+// SessionID the Claude conversation id once a hook has reported it.
 type Session struct {
-	Slot    int       `json:"slot"`
-	PID     int       `json:"pid"`
-	Cwd     string    `json:"cwd"`
-	Started time.Time `json:"started"`
+	Slot      int       `json:"slot"`
+	PID       int       `json:"pid"`
+	Cwd       string    `json:"cwd"`
+	Started   time.Time `json:"started"`
+	SessionID string    `json:"sessionId,omitempty"`
+	Pool      []int     `json:"pool,omitempty"`
 }
 
 // aliveFn reports whether a pid is a live process (test seam).
@@ -55,6 +59,23 @@ func Record(s Session) error {
 	}
 	out = append(out, s)
 	return save(out)
+}
+
+// Update applies fn to the recorded session with this pid (no-op if absent).
+func Update(pid int, fn func(*Session)) error {
+	unlock, err := lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	list := load()
+	for i := range list {
+		if list[i].PID == pid {
+			fn(&list[i])
+			return save(list)
+		}
+	}
+	return nil
 }
 
 // List returns the live sessions, pruning dead ones from the registry file.

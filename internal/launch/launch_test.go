@@ -5,7 +5,6 @@ package launch
 import (
 	"context"
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -16,11 +15,11 @@ import (
 	"github.com/00mkp/switcch/internal/session"
 )
 
-func TestPrepareRecordsSession(t *testing.T) {
+func TestPrepareDoesNotRecord(t *testing.T) {
+	// Prepare now also runs for a switch TARGET before the switch is certain;
+	// the supervisor records the session once a Claude is actually running.
 	saveRestore(t)
-	origRec := record
-	t.Cleanup(func() { record = origRec })
-
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
 	acc := account.Account{Slot: 3, Email: "a@x.com"}
 	valid := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"OK","refreshToken":"RT","expiresAt":%d}}`, time.Now().Add(time.Hour).UnixMilli())
 	currentCred = func(account.Account) (string, error) { return valid, nil }
@@ -32,17 +31,11 @@ func TestPrepareRecordsSession(t *testing.T) {
 	profileDirFn = func(account.Account) string { return "/tmp/p" }
 	defaultClaudeHome = func() string { return "/h/.claude" }
 
-	var recorded session.Session
-	record = func(s session.Session) error { recorded = s; return nil }
-
 	if _, _, err := Prepare(acc); err != nil {
 		t.Fatal(err)
 	}
-	if recorded.Slot != 3 {
-		t.Fatalf("recorded slot = %d, want 3", recorded.Slot)
-	}
-	if recorded.PID != os.Getpid() {
-		t.Fatalf("recorded pid = %d, want current pid %d", recorded.PID, os.Getpid())
+	if l, _ := session.List(); len(l) != 0 {
+		t.Fatalf("Prepare must not record a session, got %+v", l)
 	}
 }
 
@@ -171,8 +164,6 @@ func TestPrepareValidTokenSkipsRefresh(t *testing.T) {
 
 func TestPrepareCapturesBeforeSeeding(t *testing.T) {
 	saveRestore(t)
-	origRec := record
-	t.Cleanup(func() { record = origRec })
 	acc := account.Account{Slot: 1, Email: "a@x.com"}
 	valid := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"FRESH","refreshToken":"RT","expiresAt":%d}}`, time.Now().Add(time.Hour).UnixMilli())
 	captured := false
@@ -191,7 +182,6 @@ func TestPrepareCapturesBeforeSeeding(t *testing.T) {
 	syncShared = func(string, string) error { return nil }
 	profileDirFn = func(account.Account) string { return "/tmp/p" }
 	defaultClaudeHome = func() string { return "/h" }
-	record = func(session.Session) error { return nil }
 	if _, _, err := Prepare(acc); err != nil {
 		t.Fatal(err)
 	}
@@ -202,8 +192,8 @@ func TestPrepareCapturesBeforeSeeding(t *testing.T) {
 
 func TestPrepareSelfHealsOnInvalidGrant(t *testing.T) {
 	saveRestore(t)
-	origRec, origRecover := record, recoverCred
-	t.Cleanup(func() { record, recoverCred = origRec, origRecover })
+	origRecover := recoverCred
+	t.Cleanup(func() { recoverCred = origRecover })
 	acc := account.Account{Slot: 1, Email: "a@x.com"}
 	currentCred = func(account.Account) (string, error) {
 		return `{"claudeAiOauth":{"accessToken":"OLD","refreshToken":"RT","expiresAt":1}}`, nil
@@ -221,7 +211,6 @@ func TestPrepareSelfHealsOnInvalidGrant(t *testing.T) {
 	syncShared = func(string, string) error { return nil }
 	profileDirFn = func(account.Account) string { return "/tmp/p" }
 	defaultClaudeHome = func() string { return "/h" }
-	record = func(session.Session) error { return nil }
 	if _, _, err := Prepare(acc); err != nil {
 		t.Fatal(err)
 	}

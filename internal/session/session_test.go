@@ -36,3 +36,22 @@ func TestRegistryRecordsAndPrunesDead(t *testing.T) {
 		t.Fatalf("after prune List = %+v", got2)
 	}
 }
+
+func TestSessionUpdate(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	o := aliveFn
+	t.Cleanup(func() { aliveFn = o })
+	aliveFn = func(int) bool { return true }
+	_ = Record(Session{Slot: 1, PID: 10})
+	_ = Record(Session{Slot: 1, PID: 20})
+	if err := Update(20, func(s *Session) { s.Slot, s.SessionID, s.Pool = 2, "sid", []int{1, 2} }); err != nil {
+		t.Fatal(err)
+	}
+	if err := Update(99, func(s *Session) { s.Slot = 9 }); err != nil {
+		t.Fatal("absent pid is a no-op, not an error")
+	}
+	l, _ := List()
+	if len(l) != 2 || l[0].Slot != 1 || l[0].SessionID != "" || l[1].Slot != 2 || l[1].SessionID != "sid" || len(l[1].Pool) != 2 {
+		t.Fatalf("update must touch only pid 20: %+v", l)
+	}
+}

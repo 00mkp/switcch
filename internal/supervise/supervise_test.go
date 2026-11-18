@@ -22,6 +22,7 @@ import (
 	"github.com/00mkp/switcch/internal/account"
 	"github.com/00mkp/switcch/internal/config"
 	"github.com/00mkp/switcch/internal/hooks"
+	"github.com/00mkp/switcch/internal/session"
 	"github.com/00mkp/switcch/internal/usage"
 )
 
@@ -656,5 +657,25 @@ func TestExitErrSignal(t *testing.T) {
 	}
 	if exitErr(exec.Command("true").Run()) != nil {
 		t.Fatal("clean exit must be nil")
+	}
+}
+
+func TestSupervisorRecordsSession(t *testing.T) {
+	var mu sync.Mutex
+	var recs []session.Session
+	o := recordSession
+	t.Cleanup(func() { recordSession = o })
+	recordSession = func(s session.Session) error { mu.Lock(); recs = append(recs, s); mu.Unlock(); return nil }
+	if _, _, err := runFakeErr(t, fake{act: "ratelimit", pool: []account.Account{work, personal}}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(recs) < 2 || recs[0].Slot != 1 || recs[len(recs)-1].Slot != 2 {
+		t.Fatalf("records must follow the chat from work to personal: %+v", recs)
+	}
+	last := recs[len(recs)-1]
+	if last.PID != os.Getpid() || last.SessionID != "sid-1" || !slices.Equal(last.Pool, []int{1, 2}) || !last.Started.Equal(recs[0].Started) {
+		t.Fatalf("record = %+v (first %+v)", last, recs[0])
 	}
 }

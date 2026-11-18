@@ -27,6 +27,7 @@ import (
 	"github.com/00mkp/switcch/internal/credsync"
 	"github.com/00mkp/switcch/internal/hooks"
 	"github.com/00mkp/switcch/internal/launch"
+	"github.com/00mkp/switcch/internal/session"
 	"github.com/00mkp/switcch/internal/usage"
 )
 
@@ -50,14 +51,15 @@ var (
 		u, _, err := usage.Cached(context.Background(), a)
 		return u, err
 	}
-	captureBack            = func(a account.Account) { _, _ = credsync.Current(a) }
-	command                = exec.Command
-	claudePath             = func() (string, error) { return exec.LookPath("claude") }
-	claudeHelp             = runHelp
-	childrenOf             = pgrepChildren
-	pollInterval           = 100 * time.Millisecond
-	killGrace              = 5 * time.Second
-	stderr       io.Writer = os.Stderr
+	captureBack             = func(a account.Account) { _, _ = credsync.Current(a) }
+	command                 = exec.Command
+	claudePath              = func() (string, error) { return exec.LookPath("claude") }
+	claudeHelp              = runHelp
+	childrenOf              = pgrepChildren
+	recordSession           = session.Record
+	pollInterval            = 100 * time.Millisecond
+	killGrace               = 5 * time.Second
+	stderr        io.Writer = os.Stderr
 
 	usagePollInterval = 60 * time.Second // proactive: how often the active account's usage is checked
 	notify            = macNotify        // in-session messages (stderr would garble Claude's screen)
@@ -204,16 +206,27 @@ func clearMarkers(dir string) {
 	}
 }
 
+// defaultRuntimeRoot is $XDG_DATA_HOME/switcch/runtime (signal dirs + markers).
+func defaultRuntimeRoot() string {
+	base := os.Getenv("XDG_DATA_HOME")
+	if base == "" {
+		home, _ := os.UserHomeDir()
+		base = filepath.Join(home, ".local", "share")
+	}
+	return filepath.Join(base, "switcch", "runtime")
+}
+
+// LimitedRecently reports whether a switcch chat on a hit a hard limit within
+// the marker window (status --json "limited").
+func LimitedRecently(a account.Account) bool {
+	return limitedRecently(markerRoot(defaultRuntimeRoot()), a)
+}
+
 // signalDir creates this supervisor's signal dir under root (default
-// $XDG_DATA_HOME/switcch/runtime) and returns both.
+// defaultRuntimeRoot) and returns both.
 func signalDir(root string) (dir, resolvedRoot string, err error) {
 	if root == "" {
-		base := os.Getenv("XDG_DATA_HOME")
-		if base == "" {
-			home, _ := os.UserHomeDir()
-			base = filepath.Join(home, ".local", "share")
-		}
-		root = filepath.Join(base, "switcch", "runtime")
+		root = defaultRuntimeRoot()
 	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return "", "", err
@@ -257,6 +270,11 @@ type chat struct {
 	pid    int    // the running Claude
 	failed map[int]bool
 
+	started     time.Time // first launch of this supervisor (registry)
+	cwd         string
+	recordedSid string
+	recordedFor int // slot last recorded
+
 	spec       optSpec
 	specLoaded bool
 
@@ -275,6 +293,20 @@ type move struct {
 	limit     float64 // replacement targets must be under this line
 	prompt    string  // intercepted user message(s), sent verbatim
 	hasPrompt bool
+}
+
+// record writes this chat to the session registry (best-effort) when its
+// account or Claude session id changed since the last write.
+func (c *chat) record() {
+	if c.recordedFor == c.active.Slot && c.recordedSid == c.sid {
+		return
+	}
+	pool := make([]int, 0, len(c.o.Pool))
+	for _, a := range c.o.Pool {
+		pool = append(pool, a.Slot) // configured failover order, as launched
+	}
+	_ = recordSession(session.Session{Slot: c.active.Slot, PID: os.Getpid(), Cwd: c.cwd, Started: c.started, SessionID: c.sid, Pool: pool})
+	c.recordedFor, c.recordedSid = c.active.Slot, c.sid
 }
 
 func (c *chat) skip(a account.Account) bool {
@@ -495,7 +527,8 @@ func Run(ctx context.Context, o Options) error {
 	defer signal.Stop(term)
 
 	c := &chat{o: o, sigDir: sigDir, mroot: markerRoot(root), claude: claude, active: o.Pool[0],
-		sid: resumeID(o.ClaudeArgs), failed: map[int]bool{}}
+		sid: resumeID(o.ClaudeArgs), failed: map[int]bool{}, started: time.Now()}
+	c.cwd, _ = os.Getwd()
 	_, env, err := prepare(c.active)
 	if err != nil {
 		return err
@@ -514,6 +547,7 @@ func Run(ctx context.Context, o Options) error {
 		}
 		c.pid = cmd.Process.Pid
 		_ = os.WriteFile(filepath.Join(sigDir, hooks.ChildPIDFile), []byte(strconv.Itoa(c.pid)), 0o600)
+		c.record()
 		exited := make(chan error, 1)
 		go func() { exited <- cmd.Wait() }()
 
@@ -542,6 +576,7 @@ func Run(ctx context.Context, o Options) error {
 				return ctx.Err()
 			case <-time.After(pollInterval):
 				mv := c.tick()
+				c.record()
 				if mv == nil {
 					continue
 				}

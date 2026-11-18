@@ -28,7 +28,7 @@ import (
 
 // statusJSON emits the machine-readable status (the interop seam): per-account
 // usage windows, model caps, and nested live sessions — and no secrets.
-func statusJSON(accts []account.Account, sessions []session.Session, usageOf func(account.Account) (usage.Usage, error)) ([]byte, error) {
+func statusJSON(accts []account.Account, sessions []session.Session, usageOf func(account.Account) (usage.Usage, error), limited func(account.Account) bool) ([]byte, error) {
 	type jWindow struct {
 		Utilization float64    `json:"utilization"`
 		ResetsAt    *time.Time `json:"resetsAt,omitempty"`
@@ -39,14 +39,17 @@ func statusJSON(accts []account.Account, sessions []session.Session, usageOf fun
 		Active  bool    `json:"active"`
 	}
 	type jSession struct {
-		PID     int       `json:"pid"`
-		Cwd     string    `json:"cwd"`
-		Started time.Time `json:"started"`
+		PID       int       `json:"pid"`
+		Cwd       string    `json:"cwd"`
+		Started   time.Time `json:"started"`
+		SessionID string    `json:"sessionId,omitempty"`
+		Pool      []int     `json:"pool"`
 	}
 	type jAccount struct {
 		Slot       int        `json:"slot"`
 		Email      string     `json:"email"`
 		Alias      string     `json:"alias,omitempty"`
+		Limited    bool       `json:"limited"`
 		FiveHour   *jWindow   `json:"fiveHour,omitempty"`
 		SevenDay   *jWindow   `json:"sevenDay,omitempty"`
 		Models     []jModel   `json:"models,omitempty"`
@@ -62,10 +65,11 @@ func statusJSON(accts []account.Account, sessions []session.Session, usageOf fun
 		return jw
 	}
 	out := struct {
+		Schema   int        `json:"schema"`
 		Accounts []jAccount `json:"accounts"`
-	}{}
+	}{Schema: 1, Accounts: []jAccount{}}
 	for _, a := range accts {
-		ja := jAccount{Slot: a.Slot, Email: a.Email, Alias: a.Alias, Sessions: []jSession{}}
+		ja := jAccount{Slot: a.Slot, Email: a.Email, Alias: a.Alias, Limited: limited(a), Sessions: []jSession{}}
 		if u, err := usageOf(a); err == nil {
 			ja.FiveHour = win(u.FiveHour)
 			ja.SevenDay = win(u.SevenDay)
@@ -77,7 +81,11 @@ func statusJSON(accts []account.Account, sessions []session.Session, usageOf fun
 		}
 		for _, s := range sessions {
 			if s.Slot == a.Slot {
-				ja.Sessions = append(ja.Sessions, jSession{PID: s.PID, Cwd: s.Cwd, Started: s.Started})
+				pool := s.Pool
+				if pool == nil {
+					pool = []int{s.Slot}
+				}
+				ja.Sessions = append(ja.Sessions, jSession{PID: s.PID, Cwd: s.Cwd, Started: s.Started, SessionID: s.SessionID, Pool: pool})
 			}
 		}
 		out.Accounts = append(out.Accounts, ja)
@@ -402,7 +410,7 @@ func run(args []string) error {
 		b, err := statusJSON(accts, sessions, func(a account.Account) (usage.Usage, error) {
 			u, _, err := usage.Cached(context.Background(), a)
 			return u, err
-		})
+		}, supervise.LimitedRecently)
 		if err != nil {
 			return err
 		}

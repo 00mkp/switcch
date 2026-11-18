@@ -19,7 +19,6 @@ import (
 	"github.com/00mkp/switcch/internal/credsync"
 	"github.com/00mkp/switcch/internal/oauth"
 	"github.com/00mkp/switcch/internal/profile"
-	"github.com/00mkp/switcch/internal/session"
 )
 
 // Indirected for tests.
@@ -35,7 +34,6 @@ var (
 	syncShared        = profile.SyncShared
 	profileDirFn      = profile.Dir
 	defaultClaudeHome = func() string { home, _ := os.UserHomeDir(); return filepath.Join(home, ".claude") }
-	record            = session.Record
 	recoverCred       = credsync.Recover
 )
 
@@ -101,10 +99,6 @@ func Prepare(a account.Account) (string, []string, error) {
 	if err := syncShared(dir, defaultClaudeHome()); err != nil {
 		return "", nil, err
 	}
-	// Record this session (our pid becomes `claude` after Exec). Best-effort: a
-	// registry hiccup must not block launching.
-	wd, _ := os.Getwd()
-	_ = record(session.Session{Slot: a.Slot, PID: os.Getpid(), Cwd: wd, Started: time.Now()})
 	env := append([]string{"CLAUDE_CONFIG_DIR=" + dir}, profile.ScrubEnv(os.Environ())...)
 	return dir, env, nil
 }
