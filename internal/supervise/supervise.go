@@ -8,6 +8,7 @@
 package supervise
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -54,7 +55,39 @@ var (
 	pollInterval           = 100 * time.Millisecond
 	killGrace              = 5 * time.Second
 	stderr       io.Writer = os.Stderr
+
+	usagePollInterval = 60 * time.Second // proactive: how often the active account's usage is checked
+	notify            = macNotify        // advisory mode
+	clock             = time.Now         // idle-time measurement
+	// markerRoot is where cross-chat "account hit a hard limit" markers live
+	// (shared by every switcch session on this machine).
+	markerRoot = func(root string) string { return root }
+	limitedTTL = 30 * time.Minute
 )
+
+func macNotify(title, msg string) {
+	q := func(s string) string { return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"` }
+	_ = exec.Command("osascript", "-e", "display notification "+q(msg)+" with title "+q(title)).Run()
+}
+
+// limitedMarker is touched when a chat on a hits a hard limit, so other chats
+// on a arm themselves without waiting for their own usage poll.
+func limitedMarker(root string, a account.Account) string {
+	return filepath.Join(root, fmt.Sprintf("limited-%d", a.Slot))
+}
+
+func markLimited(root string, a account.Account) {
+	_ = os.WriteFile(limitedMarker(root, a), nil, 0o600)
+	now := time.Now()
+	_ = os.Chtimes(limitedMarker(root, a), now, now)
+}
+
+func limitedRecently(root string, a account.Account) bool {
+	fi, err := os.Stat(limitedMarker(root, a))
+	return err == nil && time.Since(fi.ModTime()) < limitedTTL
+}
+
+func exists(p string) bool { _, err := os.Stat(p); return err == nil }
 
 func name(a account.Account) string {
 	if a.Alias != "" {
@@ -168,7 +201,9 @@ func clearMarkers(dir string) {
 	}
 }
 
-func signalDir(root string) (string, error) {
+// signalDir creates this supervisor's signal dir under root (default
+// $XDG_DATA_HOME/switcch/runtime) and returns both.
+func signalDir(root string) (dir, resolvedRoot string, err error) {
 	if root == "" {
 		base := os.Getenv("XDG_DATA_HOME")
 		if base == "" {
@@ -178,9 +213,10 @@ func signalDir(root string) (string, error) {
 		root = filepath.Join(base, "switcch", "runtime")
 	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
-		return "", err
+		return "", "", err
 	}
-	return os.MkdirTemp(root, fmt.Sprintf("sess-%d-", os.Getpid()))
+	dir, err = os.MkdirTemp(root, fmt.Sprintf("sess-%d-", os.Getpid()))
+	return dir, root, err
 }
 
 func exitErr(err error) error {
@@ -204,12 +240,152 @@ func stopChild(cmd *exec.Cmd, exited <-chan error) {
 	}
 }
 
+// resumeID is the session the user asked to resume (--resume/-r/--session-id <id>), if any.
+func resumeID(args []string) string {
+	for i := 0; i+1 < len(args); i++ {
+		switch args[i] {
+		case "--resume", "-r", "--session-id":
+			if !strings.HasPrefix(args[i+1], "-") {
+				return args[i+1]
+			}
+		}
+	}
+	return ""
+}
+
+// chat is the supervisor's view of the running Claude process.
+type chat struct {
+	o        Options
+	sigDir   string
+	mroot    string
+	active   account.Account
+	sid      string           // last session id seen from a hook
+	armedTo  *account.Account // proactive/limited: switch target once armed
+	armedLim float64          // the line that armed it (targets must be under it)
+	idle     time.Time        // when the chat last became idle (clock())
+	lastPoll time.Time
+	notified bool
+}
+
+type move struct {
+	to     account.Account
+	args   []string
+	prompt bool // the message already carries an intercepted prompt
+}
+
+func (c *chat) relaunch(to account.Account, msg string) *move {
+	return &move{to: to, args: relaunchArgs(c.o.ClaudeArgs, c.sid, msg)}
+}
+
+func (c *chat) advise(text string) {
+	if !c.notified {
+		notify("switcch", text)
+		c.notified = true
+	}
+}
+
+func (c *chat) arm(limit float64) {
+	if tgt := next(c.o.Pool, c.active, usageOf, limit); tgt != nil {
+		c.armedTo, c.armedLim = tgt, limit
+		_ = os.WriteFile(filepath.Join(c.sigDir, hooks.ArmedFile), []byte(name(*tgt)), 0o600)
+	}
+}
+
+// retarget re-checks an armed target at switch time (its usage may have moved).
+func (c *chat) retarget() *account.Account {
+	tgt := next(c.o.Pool, c.active, usageOf, c.armedLim)
+	if tgt == nil {
+		c.armedTo = nil
+		_ = os.Remove(filepath.Join(c.sigDir, hooks.ArmedFile))
+	}
+	return tgt
+}
+
+// tick processes pending hook signals and timers; non-nil = move the chat.
+func (c *chat) tick() *move {
+	cfg := c.o.Config
+	auto := cfg.Mode != "advisory"
+	now := clock()
+
+	// 1. An intercepted prompt (chat was armed and the user sent a message).
+	if s, ok := take(c.sigDir, hooks.Intercept); ok {
+		c.sid = cmp.Or(s.SessionID, c.sid)
+		lim := cmp.Or(c.armedLim, 100)
+		tgt := next(c.o.Pool, c.active, usageOf, lim)
+		if decide(event{kind: hooks.Intercept, hasTarget: tgt != nil, mode: cfg.Mode}) == switchWithPrompt {
+			if tgt == nil { // hook already blocked it: deliver it here
+				m := c.relaunch(c.active, s.Prompt)
+				m.prompt = true
+				return m
+			}
+			m := c.relaunch(*tgt, notice(cfg.Notice, c.active, *tgt)+"\n\n"+s.Prompt)
+			m.prompt = true
+			return m
+		}
+	}
+	// 2. A hard limit: always switches in auto mode; tells other chats on this account.
+	if s, ok := take(c.sigDir, hooks.RateLimited); ok {
+		c.sid = cmp.Or(s.SessionID, c.sid)
+		markLimited(c.mroot, c.active)
+		tgt := next(c.o.Pool, c.active, usageOf, 100)
+		if decide(event{kind: hooks.RateLimited, hasTarget: tgt != nil, mode: cfg.Mode}) == switchAcct {
+			return c.relaunch(*tgt, notice(cfg.Notice, c.active, *tgt))
+		}
+		if !auto {
+			c.advise(name(c.active) + " hit its usage limit")
+		}
+		// No viable account: leave Claude showing its limit (ration).
+	}
+	// 3. Turn end: an armed chat moves now, so no turn is ever cut off.
+	if s, ok := take(c.sigDir, hooks.Stopped); ok {
+		c.sid = cmp.Or(s.SessionID, c.sid)
+		c.idle = now
+		if c.armedTo != nil && auto {
+			if tgt := c.retarget(); tgt != nil {
+				return c.relaunch(*tgt, notice(cfg.Notice, c.active, *tgt))
+			}
+		}
+	}
+	busy := exists(filepath.Join(c.sigDir, hooks.BusyFile))
+	if busy {
+		c.idle = now
+	}
+	// 4. Arming: another chat hit a hard limit on this account, or (proactive)
+	// this account crossed the threshold.
+	if c.armedTo == nil {
+		over, lim := false, 100.0
+		if limitedRecently(c.mroot, c.active) {
+			over = true
+		} else if cfg.Trigger == "proactive" && time.Since(c.lastPoll) >= usagePollInterval {
+			c.lastPoll = time.Now()
+			if u, err := usageOf(c.active); err == nil && peak(u) >= cfg.Threshold {
+				over, lim = true, cfg.Threshold
+			}
+		}
+		if over {
+			if auto {
+				c.arm(lim)
+			} else {
+				c.advise(fmt.Sprintf("%s is over %.0f%% of its usage — consider switching accounts", name(c.active), lim))
+			}
+		}
+	}
+	// 5. Optional: move an armed chat that has sat idle long enough.
+	if c.armedTo != nil && auto && !busy && c.sid != "" && cfg.IdleMigrateMinutes > 0 &&
+		now.Sub(c.idle) >= time.Duration(cfg.IdleMigrateMinutes)*time.Minute {
+		if tgt := c.retarget(); tgt != nil {
+			return c.relaunch(*tgt, notice(cfg.Notice, c.active, *tgt))
+		}
+	}
+	return nil
+}
+
 // Run supervises one chat until the user ends it.
 func Run(ctx context.Context, o Options) error {
 	if len(o.Pool) == 0 {
 		return errors.New("supervise: empty account pool")
 	}
-	sigDir, err := signalDir(o.RuntimeDir)
+	sigDir, root, err := signalDir(o.RuntimeDir)
 	if err != nil {
 		return err
 	}
@@ -232,15 +408,15 @@ func Run(ctx context.Context, o Options) error {
 	signal.Notify(term, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(term)
 
-	limit := 100.0
-	active := o.Pool[0]
+	c := &chat{o: o, sigDir: sigDir, mroot: markerRoot(root), active: o.Pool[0], sid: resumeID(o.ClaudeArgs)}
 	args := o.ClaudeArgs
 	for {
-		_, env, err := prepare(active)
+		_, env, err := prepare(c.active)
 		if err != nil {
 			return err
 		}
 		clearMarkers(sigDir)
+		c.armedTo, c.armedLim, c.notified, c.lastPoll, c.idle = nil, 0, false, time.Time{}, clock()
 		cmd := command(claude, args...)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 		cmd.Env = childEnv(env, sigDir)
@@ -250,54 +426,35 @@ func Run(ctx context.Context, o Options) error {
 		exited := make(chan error, 1)
 		go func() { exited <- cmd.Wait() }()
 
-		var to account.Account
-		var nextArgs []string
-	watch:
-		for {
+		var m *move
+		for m == nil {
 			select {
 			case err := <-exited:
-				captureBack(active)
+				captureBack(c.active)
 				return exitErr(err)
 			case s := <-term:
 				_ = cmd.Process.Signal(s)
 				<-exited
-				captureBack(active)
+				captureBack(c.active)
 				return nil
 			case <-ctx.Done():
 				stopChild(cmd, exited)
-				captureBack(active)
+				captureBack(c.active)
 				return ctx.Err()
 			case <-time.After(pollInterval):
-				if s, ok := take(sigDir, hooks.Intercept); ok {
-					tgt := next(o.Pool, active, usageOf, limit)
-					to = active
-					msg := s.Prompt
-					if tgt != nil {
-						to = *tgt
-						msg = notice(o.Config.Notice, active, to) + "\n\n" + s.Prompt
-					}
-					if decide(event{kind: hooks.Intercept, hasTarget: tgt != nil, mode: o.Config.Mode}) == switchWithPrompt {
-						nextArgs = relaunchArgs(o.ClaudeArgs, s.SessionID, msg)
-						break watch
-					}
-				}
-				if s, ok := take(sigDir, hooks.RateLimited); ok {
-					tgt := next(o.Pool, active, usageOf, 100)
-					if decide(event{kind: hooks.RateLimited, hasTarget: tgt != nil, mode: o.Config.Mode}) == switchAcct {
-						to = *tgt
-						nextArgs = relaunchArgs(o.ClaudeArgs, s.SessionID, notice(o.Config.Notice, active, to))
-						break watch
-					}
-					// No viable account (or advisory): leave Claude showing its limit.
-				}
-				_, _ = take(sigDir, hooks.Stopped)
+				m = c.tick()
 			}
 		}
 
-		fmt.Fprintf(stderr, "\nswitcch: moving this chat %s → %s…\n", name(active), name(to))
+		fmt.Fprintf(stderr, "\nswitcch: moving this chat %s → %s…\n", name(c.active), name(m.to))
 		stopChild(cmd, exited)
-		captureBack(active)
-		active = to
-		args = nextArgs
+		// A message the user sent while we were stopping Claude was blocked by
+		// the (armed) hook: carry it over rather than lose it.
+		if s, ok := take(sigDir, hooks.Intercept); ok && !m.prompt {
+			m.args[len(m.args)-1] += "\n\n" + s.Prompt
+		}
+		captureBack(c.active)
+		c.active = m.to
+		args = m.args
 	}
 }
