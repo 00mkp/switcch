@@ -276,6 +276,12 @@ type chat struct {
 	model       string
 	triedModels map[string]bool
 
+	// Wait-for-reset (per Claude process): resume on waitFor at waitUntil
+	// unless the user sends a message after waitSince.
+	waitUntil time.Time
+	waitSince time.Time
+	waitFor   account.Account
+
 	started     time.Time // first launch of this supervisor (registry)
 	cwd         string
 	recordedSid string
@@ -320,6 +326,17 @@ func (c *chat) record() {
 
 func (c *chat) emit(reason string, a account.Account) {
 	emitEvent(c.o.Config.EventCommand, event.Event{SessionID: c.sid, Account: a.Email, Reason: reason, Timestamp: time.Now()})
+}
+
+// startWait schedules a resume at the pool's earliest reset (spec §5.6, opt-in).
+func (c *chat) startWait() {
+	a, at, ok := earliestReset(c.o.Pool, usageOf)
+	if !ok {
+		notify("switcch", "All accounts for this chat are at their limit — no reset time known; not waiting.")
+		return
+	}
+	c.waitFor, c.waitUntil, c.waitSince = a, at, time.Now()
+	notify("switcch", fmt.Sprintf("All accounts for this chat are at their limit — continuing on %s at %s.", name(a), at.Local().Format("15:04")))
 }
 
 func (c *chat) skip(a account.Account) bool {
@@ -427,6 +444,9 @@ func (c *chat) tick() *move {
 		}
 		if tgt == nil {
 			c.emit(event.PoolExhausted, c.active)
+			if auto && cfg.WaitForReset {
+				c.startWait()
+			}
 		}
 		if !auto {
 			c.advise(name(c.active) + " hit its usage limit")
@@ -472,6 +492,17 @@ func (c *chat) tick() *move {
 			} else {
 				c.advise(fmt.Sprintf("%s is over %.0f%% of its usage — consider switching accounts", name(c.active), lim))
 			}
+		}
+	}
+	// Waiting for a reset: the user typing takes over; otherwise resume on time.
+	if !c.waitUntil.IsZero() {
+		if fi, err := os.Stat(filepath.Join(c.sigDir, hooks.BusyFile)); err == nil && fi.ModTime().After(c.waitSince) {
+			c.waitUntil = time.Time{}
+		} else if !now.Before(c.waitUntil) {
+			to := c.waitFor
+			c.waitUntil = time.Time{}
+			_ = os.Remove(limitedMarker(c.mroot, to))
+			return &move{to: to, limit: 100, prompt: cfg.ResumeMessage, hasPrompt: true}
 		}
 	}
 	// 5. Optional: move an armed chat that has sat idle long enough.
@@ -576,6 +607,7 @@ func Run(ctx context.Context, o Options) error {
 	for {
 		clearMarkers(sigDir)
 		c.armedTo, c.armedLim, c.notified, c.lastPoll, c.idle, c.baseline = nil, 0, false, time.Time{}, clock(), nil
+		c.waitUntil = time.Time{}
 		cmd := command(claude, args...)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 		cmd.Env = childEnv(env, sigDir)
@@ -654,4 +686,39 @@ func Run(ctx context.Context, o Options) error {
 		args = relaunchArgs(o.ClaudeArgs, c.optSpec(), c.model, c.sid, msg)
 		c.active, env = m.to, nextEnv
 	}
+}
+
+// earliestReset returns the pool account that frees up first: an account is
+// free when every window at/over 100% has reset, so its time is the latest
+// such reset. Accounts with no known reset time are ignored.
+func earliestReset(pool []account.Account, usageOf func(account.Account) (usage.Usage, error)) (account.Account, time.Time, bool) {
+	var best account.Account
+	var bestAt time.Time
+	for _, a := range pool {
+		u, err := usageOf(a)
+		if err != nil {
+			continue
+		}
+		var at time.Time
+		known := true
+		for _, w := range []usage.Window{u.FiveHour, u.SevenDay} {
+			if w.Utilization < 100 {
+				continue
+			}
+			if !w.HasReset {
+				known = false
+				break
+			}
+			if w.ResetsAt.After(at) {
+				at = w.ResetsAt
+			}
+		}
+		if !known || at.IsZero() {
+			continue
+		}
+		if bestAt.IsZero() || at.Before(bestAt) {
+			best, bestAt = a, at
+		}
+	}
+	return best, bestAt, !bestAt.IsZero()
 }

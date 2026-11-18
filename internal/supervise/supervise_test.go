@@ -478,6 +478,9 @@ func scripted(t *testing.T, cfg config.Config, pool []account.Account, util map[
 		if a.Slot == pool[0].Slot {
 			polls++
 		}
+		if scriptedUsage != nil {
+			return scriptedUsage(a)
+		}
 		return usage.Usage{FiveHour: usage.Window{Utilization: util[a.Slot]}}, nil
 	}
 	pollInterval = 5 * time.Millisecond
@@ -485,6 +488,7 @@ func scripted(t *testing.T, cfg config.Config, pool []account.Account, util map[
 	notify = func(title, msg string) { notes = append(notes, msg) }
 	// A fake clock that runs 1000x fast so idle minutes elapse in milliseconds.
 	start := time.Now()
+	scriptStart = start
 	clock = func() time.Time { return start.Add(time.Since(start) * 1000) }
 
 	go func() {
@@ -515,6 +519,8 @@ func scripted(t *testing.T, cfg config.Config, pool []account.Account, util map[
 var (
 	scriptedArgs     []string
 	scriptedChildren func(int) []int
+	scriptedUsage    func(account.Account) (usage.Usage, error)
+	scriptStart      time.Time // the scripted run's fake-clock origin
 )
 
 func busy(dir string) { _ = os.WriteFile(filepath.Join(dir, hooks.BusyFile), nil, 0o600) }
@@ -779,5 +785,74 @@ func TestModelCapDoesNotMarkAccountLimited(t *testing.T) {
 	}
 	if _, err := os.Stat(limitedMarker(root, work)); err == nil {
 		t.Fatal("a model cap must not mark the whole account limited")
+	}
+}
+
+// ---- Task 6: wait for reset ----
+
+// dryUntil reports work dry until +3 fake minutes and personal until +5.
+func dryUntil(t *testing.T) {
+	t.Helper()
+	scriptedUsage = func(a account.Account) (usage.Usage, error) {
+		mins := map[int]time.Duration{1: 3, 2: 5}[a.Slot]
+		return usage.Usage{FiveHour: usage.Window{Utilization: 100, HasReset: true, ResetsAt: scriptStart.Add(mins * time.Minute)}}, nil
+	}
+	t.Cleanup(func() { scriptedUsage = nil })
+}
+
+func hardLimit(d string) {
+	_ = hooks.WriteSignal(d, hooks.Signal{Kind: hooks.RateLimited, SessionID: "sid-1"})
+}
+
+func TestEarliestReset(t *testing.T) {
+	now := time.Now()
+	u := map[int]usage.Usage{
+		1: {FiveHour: usage.Window{Utilization: 100, HasReset: true, ResetsAt: now.Add(3 * time.Minute)},
+			SevenDay: usage.Window{Utilization: 100, HasReset: true, ResetsAt: now.Add(9 * time.Minute)}}, // free only when BOTH reset
+		2: {FiveHour: usage.Window{Utilization: 100, HasReset: true, ResetsAt: now.Add(5 * time.Minute)}},
+		3: {FiveHour: usage.Window{Utilization: 100}}, // reset unknown: ignored
+	}
+	of := func(a account.Account) (usage.Usage, error) { return u[a.Slot], nil }
+	a, at, ok := earliestReset([]account.Account{work, personal, other}, of)
+	if !ok || a.Slot != personal.Slot || !at.Equal(now.Add(5*time.Minute)) {
+		t.Fatalf("got %v %v %v, want personal at +5m", a.Alias, at, ok)
+	}
+	if _, _, ok := earliestReset([]account.Account{other}, of); ok {
+		t.Fatal("no known reset ⇒ false")
+	}
+}
+
+func TestWaitForResetResumes(t *testing.T) {
+	dryUntil(t)
+	c := proactive()
+	c.WaitForReset = true
+	l, _, notes, _ := scripted(t, c, []account.Account{work, personal}, nil, []step{{10 * time.Millisecond, hardLimit}})
+	if len(l) != 2 || l[1].ConfigDir != "/profiles/work" {
+		t.Fatalf("want a resume on work after its reset, got %+v", l)
+	}
+	if _, msg, ok := resumeOf(l[1].Args); !ok || msg != c.ResumeMessage {
+		t.Fatalf("resume message = %q", l[1].Args)
+	}
+	if len(notes) != 1 || !strings.Contains(notes[0], "work") {
+		t.Fatalf("want one notification naming work, got %q", notes)
+	}
+}
+
+func TestWaitForResetCancelledByUser(t *testing.T) {
+	dryUntil(t)
+	c := proactive()
+	c.WaitForReset = true
+	l, _, _, _ := scripted(t, c, []account.Account{work, personal}, nil,
+		[]step{{10 * time.Millisecond, hardLimit}, {60 * time.Millisecond, busy}})
+	if len(l) != 1 {
+		t.Fatalf("a chat the user took over must not be restarted, got %d launches", len(l))
+	}
+}
+
+func TestWaitForResetOffByDefault(t *testing.T) {
+	dryUntil(t)
+	l, _, notes, _ := scripted(t, proactive(), []account.Account{work, personal}, nil, []step{{10 * time.Millisecond, hardLimit}})
+	if len(l) != 1 || len(notes) != 0 {
+		t.Fatalf("default: no wait, no notification; got %d launches, notes %q", len(l), notes)
 	}
 }
