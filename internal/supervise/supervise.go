@@ -70,6 +70,7 @@ var (
 	// (shared by every switcch session on this machine).
 	markerRoot = func(root string) string { return root }
 	limitedTTL = 30 * time.Minute
+	resetGrace = 30 * time.Second // wait-for-reset resumes this long after the reset
 	// earlyExit: a relaunched Claude that dies this soon gets its carried
 	// message printed, so it is never silently lost.
 	earlyExit = 15 * time.Second
@@ -330,14 +331,18 @@ func (c *chat) emit(reason string, a account.Account) {
 
 // startWait schedules a resume at the pool's earliest reset (spec §5.6, opt-in).
 func (c *chat) startWait() {
-	a, at, ok := earliestReset(c.o.Pool, usageOf)
+	a, at, ok := earliestReset(c.o.Pool, usageOf, clock(), c.skipWait, c.isLimited)
 	if !ok {
 		notify("switcch", "All accounts for this chat are at their limit — no reset time known; not waiting.")
 		return
 	}
-	c.waitFor, c.waitUntil, c.waitSince = a, at, time.Now()
+	// A short grace absorbs clock skew between this Mac and the server.
+	c.waitFor, c.waitUntil, c.waitSince = a, at.Add(resetGrace), time.Now()
 	notify("switcch", fmt.Sprintf("All accounts for this chat are at their limit — continuing on %s at %s.", name(a), at.Local().Format("15:04")))
 }
+
+func (c *chat) skipWait(a account.Account) bool  { return c.failed[a.Slot] }
+func (c *chat) isLimited(a account.Account) bool { return limitedRecently(c.mroot, a) }
 
 func (c *chat) skip(a account.Account) bool {
 	return c.failed[a.Slot] || limitedRecently(c.mroot, a)
@@ -688,23 +693,31 @@ func Run(ctx context.Context, o Options) error {
 	}
 }
 
-// earliestReset returns the pool account that frees up first: an account is
-// free when every window at/over 100% has reset, so its time is the latest
-// such reset. Accounts with no known reset time are ignored.
-func earliestReset(pool []account.Account, usageOf func(account.Account) (usage.Usage, error)) (account.Account, time.Time, bool) {
+// earliestReset returns the pool account that frees up first, and when.
+// An account is free when every window at/over 100% has reset (its time is the
+// latest such reset). An account that recently hit a hard limit (limited) but
+// whose cached reading is still under 100% is bound by its fullest window.
+// Resets at or before now (stale readings) and skipped accounts don't count;
+// an account at 100% with an unknown reset time is ignored.
+func earliestReset(pool []account.Account, usageOf func(account.Account) (usage.Usage, error), now time.Time, skip, limited func(account.Account) bool) (account.Account, time.Time, bool) {
 	var best account.Account
 	var bestAt time.Time
 	for _, a := range pool {
+		if skip(a) {
+			continue
+		}
 		u, err := usageOf(a)
 		if err != nil {
 			continue
 		}
+		windows := []usage.Window{u.FiveHour, u.SevenDay}
 		var at time.Time
-		known := true
-		for _, w := range []usage.Window{u.FiveHour, u.SevenDay} {
+		known, full := true, false
+		for _, w := range windows {
 			if w.Utilization < 100 {
 				continue
 			}
+			full = true
 			if !w.HasReset {
 				known = false
 				break
@@ -713,8 +726,23 @@ func earliestReset(pool []account.Account, usageOf func(account.Account) (usage.
 				at = w.ResetsAt
 			}
 		}
-		if !known || at.IsZero() {
+		if !known {
 			continue
+		}
+		if !full && limited(a) {
+			var top *usage.Window
+			for i := range windows {
+				w := &windows[i]
+				if w.HasReset && w.ResetsAt.After(now) && (top == nil || w.Utilization > top.Utilization) {
+					top = w
+				}
+			}
+			if top != nil {
+				at = top.ResetsAt
+			}
+		}
+		if !at.After(now) {
+			continue // nothing to wait for, or a stale reset already past
 		}
 		if bestAt.IsZero() || at.Before(bestAt) {
 			best, bestAt = a, at

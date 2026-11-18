@@ -813,12 +813,72 @@ func TestEarliestReset(t *testing.T) {
 		3: {FiveHour: usage.Window{Utilization: 100}}, // reset unknown: ignored
 	}
 	of := func(a account.Account) (usage.Usage, error) { return u[a.Slot], nil }
-	a, at, ok := earliestReset([]account.Account{work, personal, other}, of)
+	no := func(account.Account) bool { return false }
+	a, at, ok := earliestReset([]account.Account{work, personal, other}, of, now, no, no)
 	if !ok || a.Slot != personal.Slot || !at.Equal(now.Add(5*time.Minute)) {
 		t.Fatalf("got %v %v %v, want personal at +5m", a.Alias, at, ok)
 	}
-	if _, _, ok := earliestReset([]account.Account{other}, of); ok {
+	if _, _, ok := earliestReset([]account.Account{other}, of, now, no, no); ok {
 		t.Fatal("no known reset ⇒ false")
+	}
+	// A reset already in the past (stale cached reading) is not a reset to wait for.
+	past := func(account.Account) (usage.Usage, error) {
+		return usage.Usage{FiveHour: usage.Window{Utilization: 100, HasReset: true, ResetsAt: now.Add(-time.Minute)}}, nil
+	}
+	if _, _, ok := earliestReset([]account.Account{work}, past, now, no, no); ok {
+		t.Fatal("a past reset must be ignored")
+	}
+	// An account this chat can't use (its login failed) is never waited for.
+	skipP := func(a account.Account) bool { return a.Slot == personal.Slot }
+	if a, _, ok := earliestReset([]account.Account{personal, work}, of, now, skipP, no); !ok || a.Slot != work.Slot {
+		t.Fatalf("skipped account chosen: %v %v", a.Alias, ok)
+	}
+	// The account that just hit a hard limit often still reads under 100%
+	// (cached): its fullest window with a future reset is the binding one.
+	stale := func(account.Account) (usage.Usage, error) {
+		return usage.Usage{FiveHour: usage.Window{Utilization: 96, HasReset: true, ResetsAt: now.Add(3 * time.Minute)},
+			SevenDay: usage.Window{Utilization: 40, HasReset: true, ResetsAt: now.Add(72 * time.Hour)}}, nil
+	}
+	isW := func(a account.Account) bool { return a.Slot == work.Slot }
+	if a, at, ok := earliestReset([]account.Account{work}, stale, now, no, isW); !ok || a.Slot != work.Slot || !at.Equal(now.Add(3*time.Minute)) {
+		t.Fatalf("limited account under 100%%: got %v %v %v, want work at +3m", a.Alias, at, ok)
+	}
+	if _, _, ok := earliestReset([]account.Account{work}, stale, now, no, no); ok {
+		t.Fatal("an account that is neither limited nor at 100% is not waited for")
+	}
+}
+
+func TestWaitForResetIgnoresPastReset(t *testing.T) {
+	// Stale usage says work reset a minute ago, yet the server still refuses:
+	// switcch must not restart the chat in a loop.
+	scriptedUsage = func(a account.Account) (usage.Usage, error) {
+		return usage.Usage{FiveHour: usage.Window{Utilization: 100, HasReset: true, ResetsAt: scriptStart.Add(-time.Minute)}}, nil
+	}
+	t.Cleanup(func() { scriptedUsage = nil })
+	c := proactive()
+	c.WaitForReset = true
+	l, _, notes, _ := scripted(t, c, []account.Account{work, personal}, nil, []step{{10 * time.Millisecond, hardLimit}})
+	if len(l) != 1 {
+		t.Fatalf("a past reset must not trigger a resume, got %d launches", len(l))
+	}
+	if len(notes) != 1 || !strings.Contains(notes[0], "no reset time known") {
+		t.Fatalf("notes = %q", notes)
+	}
+}
+
+func TestWaitForResetPinnedChatWithStaleReading(t *testing.T) {
+	// A pinned chat (pool of one) hits its limit while the cached reading is
+	// still 96%: it waits for that window's reset and resumes.
+	scriptedUsage = func(a account.Account) (usage.Usage, error) {
+		return usage.Usage{FiveHour: usage.Window{Utilization: 96, HasReset: true, ResetsAt: scriptStart.Add(3 * time.Minute)}}, nil
+	}
+	t.Cleanup(func() { scriptedUsage = nil })
+	c := proactive()
+	c.Trigger = "reactive"
+	c.WaitForReset = true
+	l, _, _, _ := scripted(t, c, []account.Account{work}, nil, []step{{10 * time.Millisecond, hardLimit}})
+	if len(l) != 2 || l[1].ConfigDir != "/profiles/work" {
+		t.Fatalf("pinned chat must wait and resume on work, got %+v", l)
 	}
 }
 
