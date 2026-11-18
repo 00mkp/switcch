@@ -129,3 +129,20 @@ func TestDeleteToleratesMissing(t *testing.T) {
 		t.Fatalf("Delete of absent should be nil, got %v", err)
 	}
 }
+
+func TestCorruptFileStartingWithBraceIsNotMigrated(t *testing.T) {
+	// A random GCM nonce starts with '{' about 1 time in 256. A corrupt
+	// encrypted file like that must fail, not be "migrated" as plaintext.
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	useTestKey(t)
+	if err := Write(4, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(Path(4))
+	raw[0] = '{'
+	raw[len(raw)-1] ^= 0xff
+	_ = os.WriteFile(Path(4), raw, 0o600)
+	if got, err := Read(4); err == nil {
+		t.Fatalf("corrupt ciphertext accepted as a credential: %q", got)
+	}
+}

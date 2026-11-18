@@ -13,6 +13,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -90,8 +91,10 @@ func Read(slot int) (string, error) {
 	}
 	pt, err := open(key, raw)
 	if err != nil {
-		// Migration: a pre-encryption file is plaintext JSON (starts with '{').
-		if bytes.HasPrefix(bytes.TrimSpace(raw), []byte("{")) {
+		// Migration: a pre-encryption file is plaintext JSON. Require VALID JSON,
+		// not just a leading '{': a random nonce starts with '{' 1 time in 256,
+		// and a corrupt ciphertext must fail rather than become a "credential".
+		if bytes.HasPrefix(bytes.TrimSpace(raw), []byte("{")) && json.Valid(raw) {
 			if werr := Write(slot, string(raw)); werr != nil {
 				return "", fmt.Errorf("credfile: migrate slot %d: %w", slot, werr)
 			}
