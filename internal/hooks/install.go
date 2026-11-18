@@ -205,6 +205,9 @@ func edit(settingsPath, exe string, add bool) error {
 		return err
 	}
 	out.WriteByte('\n')
+	if bytes.Equal(out.Bytes(), b) {
+		return nil // already up to date: don't touch a file Claude Code watches
+	}
 	tmp := path + ".switcch.tmp"
 	if err := os.WriteFile(tmp, out.Bytes(), mode); err != nil {
 		return err

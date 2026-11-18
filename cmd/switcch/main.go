@@ -19,9 +19,9 @@ import (
 	"github.com/00mkp/switcch/internal/capture"
 	"github.com/00mkp/switcch/internal/config"
 	"github.com/00mkp/switcch/internal/hooks"
-	"github.com/00mkp/switcch/internal/launch"
 	"github.com/00mkp/switcch/internal/oauth"
 	"github.com/00mkp/switcch/internal/session"
+	"github.com/00mkp/switcch/internal/supervise"
 	"github.com/00mkp/switcch/internal/usage"
 )
 
@@ -451,13 +451,62 @@ func run(args []string) error {
 			}
 			return err
 		}
-		dir, env, err := launch.Prepare(a)
+		pool, err := resolvePool(store, a, cmd)
 		if err != nil {
-			return friendlyLaunchError(cmd.ref, err)
+			return err
 		}
-		return launch.Exec(dir, env, cmd.claudeArgs)
+		cfg, err := effectiveConfig(cmd)
+		if err != nil {
+			return err
+		}
+		if p, exe, err := hookPaths(); err == nil {
+			if err := hooks.Install(p, exe); err != nil {
+				fmt.Fprintf(os.Stderr, "switcch: warning: could not install hooks (%v) — this chat runs without automatic failover\n", err)
+			}
+		}
+		err = supervise.Run(context.Background(), supervise.Options{Pool: pool, Config: cfg, ClaudeArgs: cmd.claudeArgs})
+		return friendlyLaunchError(cmd.ref, err)
 	}
 	return nil
+}
+
+// resolvePool is the session's account pool: the account plus its configured
+// fallback, unless --pin (just the account) or --fallback (override list).
+func resolvePool(store *account.Store, a account.Account, cmd command) ([]account.Account, error) {
+	if cmd.pin {
+		return []account.Account{a}, nil
+	}
+	if cmd.fallback == nil {
+		return store.Pool(a), nil
+	}
+	pool := []account.Account{a}
+	for _, r := range cmd.fallback {
+		f, err := store.Resolve(strings.TrimSpace(r))
+		if err != nil {
+			return nil, fmt.Errorf("--fallback %q: %w", r, err)
+		}
+		if f.Slot != a.Slot {
+			pool = append(pool, f)
+		}
+	}
+	return pool, nil
+}
+
+// effectiveConfig is the saved config with this launch's flag overrides applied.
+func effectiveConfig(cmd command) (config.Config, error) {
+	c, err := config.Load()
+	if err != nil {
+		return c, err
+	}
+	for _, kv := range [][2]string{{"trigger", cmd.trigger}, {"threshold", cmd.threshold}, {"mode", cmd.mode}} {
+		if kv[1] == "" {
+			continue
+		}
+		if err := config.Validate(&c, kv[0], kv[1]); err != nil {
+			return c, fmt.Errorf("--%s: %w", kv[0], err)
+		}
+	}
+	return c, nil
 }
 
 func main() {
@@ -470,7 +519,12 @@ func main() {
 		}
 		os.Exit(code)
 	}
-	if err := run(os.Args[1:]); err != nil {
+	err := run(os.Args[1:])
+	var ee *supervise.ExitError
+	if errors.As(err, &ee) {
+		os.Exit(ee.Code) // Claude's own exit status; it already printed why
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "switcch: "+err.Error())
 		os.Exit(1)
 	}

@@ -242,3 +242,47 @@ func TestRouteSetupAndUninstallHooks(t *testing.T) {
 		t.Fatalf("uninstall-hooks: %+v %v", c, err)
 	}
 }
+
+func TestResolvePool(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	s, _ := account.Load()
+	s.Add(account.Account{Email: "p@x.com", Alias: "personal"})
+	s.Add(account.Account{Email: "w@x.com", Alias: "work"})
+	s.Add(account.Account{Email: "o@x.com", Alias: "other"})
+	_ = s.SetFallback("work", []string{"personal"})
+	w, _ := s.Resolve("work")
+
+	names := func(p []account.Account) string {
+		var n []string
+		for _, a := range p {
+			n = append(n, a.Alias)
+		}
+		return strings.Join(n, ",")
+	}
+	if p, _ := resolvePool(s, w, command{}); names(p) != "work,personal" {
+		t.Fatalf("configured pool = %s", names(p))
+	}
+	if p, _ := resolvePool(s, w, command{pin: true}); names(p) != "work" {
+		t.Fatalf("--pin pool = %s", names(p))
+	}
+	if p, _ := resolvePool(s, w, command{fallback: []string{"other"}}); names(p) != "work,other" {
+		t.Fatalf("--fallback override pool = %s", names(p))
+	}
+	if _, err := resolvePool(s, w, command{fallback: []string{"nope"}}); err == nil {
+		t.Fatal("unknown --fallback account must error")
+	}
+}
+
+func TestEffectiveConfigAppliesFlagOverrides(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	c, err := effectiveConfig(command{threshold: "75", trigger: "reactive"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Threshold != 75 || c.Trigger != "reactive" || c.Mode != "auto" {
+		t.Fatalf("effective config = %+v", c)
+	}
+	if _, err := effectiveConfig(command{threshold: "500"}); err == nil {
+		t.Fatal("invalid --threshold must error")
+	}
+}
