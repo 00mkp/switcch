@@ -175,7 +175,7 @@ func edit(settingsPath, exe string, add bool) error {
 				return fmt.Errorf("hooks: malformed %s hooks: %w", ev, err)
 			}
 		}
-		var kept []json.RawMessage
+		var kept [][]byte
 		for _, g := range groups {
 			if !isOurs(g) {
 				kept = append(kept, g)
@@ -188,11 +188,9 @@ func edit(settingsPath, exe string, add bool) error {
 			hk = del(hk, ev)
 			continue
 		}
-		v, err := json.Marshal(kept)
-		if err != nil {
-			return err
-		}
-		hk = set(hk, ev, v)
+		// Join the raw groups by hand: json.Marshal would HTML-escape the
+		// user's own hook commands (& < > → \u0026 ...).
+		hk = set(hk, ev, append(append([]byte("["), bytes.Join(kept, []byte(","))...), ']'))
 	}
 	if len(hk) == 0 {
 		top = del(top, "hooks")

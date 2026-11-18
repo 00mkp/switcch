@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -30,7 +31,43 @@ type Signal struct {
 const (
 	ArmedFile = "armed" // supervisor: this chat's account is over the line; content = next account name
 	BusyFile  = "busy"  // hook: a turn is in progress (prompt submitted, no Stop yet)
+	// ChildPIDFile holds the pid of the Claude process the supervisor started.
+	ChildPIDFile = "child.pid"
 )
+
+// Seams for the process table.
+var (
+	selfParent = os.Getppid
+	procInfo   = procInfoSys
+)
+
+var shells = map[string]bool{"sh": true, "bash": true, "zsh": true, "dash": true, "ksh": true, "fish": true, "env": true}
+
+// fromSupervisedClaude reports whether this hook was fired by the Claude the
+// supervisor started, not by a nested claude (run from a Bash tool or a script)
+// that inherited SWITCCH_SIGNAL_DIR: the first non-shell ancestor must be it.
+func fromSupervisedClaude(dir string) bool {
+	b, err := os.ReadFile(filepath.Join(dir, ChildPIDFile))
+	if err != nil {
+		return false
+	}
+	child, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || child <= 1 {
+		return false
+	}
+	pid := selfParent()
+	for range 8 {
+		if pid == child {
+			return true
+		}
+		ppid, comm, err := procInfo(pid)
+		if err != nil || !shells[comm] {
+			return false // first non-shell ancestor isn't the supervised claude
+		}
+		pid = ppid
+	}
+	return false
+}
 
 type hookPayload struct {
 	SessionID            string `json:"session_id"`
@@ -112,7 +149,7 @@ func ReadSignal(dir string, k Kind) (Signal, error) {
 // any stderr message; exit 2 on UserPromptSubmit blocks the prompt.
 func HandleHook(event string, stdin io.Reader, getenv func(string) string) (int, string) {
 	dir := getenv("SWITCCH_SIGNAL_DIR")
-	if dir == "" {
+	if dir == "" || !fromSupervisedClaude(dir) {
 		return 0, ""
 	}
 	raw, _ := io.ReadAll(stdin)
@@ -135,6 +172,9 @@ func HandleHook(event string, stdin io.Reader, getenv func(string) string) (int,
 		_ = WriteSignal(dir, s)
 	case RateLimited:
 		_ = WriteSignal(dir, s)
+	}
+	if event == "StopFailure" { // a failed turn is still a finished turn
+		_ = os.Remove(filepath.Join(dir, BusyFile))
 	}
 	return 0, ""
 }

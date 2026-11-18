@@ -116,3 +116,35 @@ func TestInstallFollowsSymlinkAndCreatesMissing(t *testing.T) {
 		t.Fatal("missing settings file should be created with the hooks")
 	}
 }
+
+func TestInstallLeavesUnrelatedHookBytesAlone(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "settings.json")
+	orig := `{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "a > /dev/null 2>&1 && b <x>"
+          }
+        ]
+      }
+    ]
+  }
+}
+`
+	_ = os.WriteFile(p, []byte(orig), 0o644)
+	if err := Install(p, "/opt/bin/switcch"); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(p); !strings.Contains(string(b), `"a > /dev/null 2>&1 && b <x>"`) {
+		t.Fatalf("unrelated hook command was re-escaped:\n%s", b)
+	}
+	if err := Uninstall(p); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(p); string(b) != orig {
+		t.Fatalf("install+uninstall must restore the file byte-for-byte:\n%s", b)
+	}
+}

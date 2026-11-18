@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // SharedItems are the ~/.claude entries symlinked into every profile so all
@@ -29,10 +30,16 @@ var scrubKeys = map[string]bool{
 	"CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR":     true,
 }
 
+// alwaysShared are created in claudeHome when missing: without them each
+// profile would keep its own transcripts and a cross-account resume would find
+// no conversation.
+var alwaysShared = map[string]bool{"projects": true, "history.jsonl": true}
+
 // SyncShared symlinks each existing SharedItems entry from claudeHome into
 // profileDir, resolving a symlinked source to its target (so Claude's atomic
-// settings write never clobbers a link-to-link). Missing sources are skipped.
-// It is idempotent and records what it manages in .switcch-shared.json.
+// settings write never clobbers a link-to-link). Missing sources are skipped,
+// except transcripts, which are created. It is idempotent, never deletes user
+// data, and records what it manages in .switcch-shared.json.
 func SyncShared(profileDir, claudeHome string) error {
 	if err := os.MkdirAll(profileDir, 0o700); err != nil {
 		return err
@@ -41,6 +48,16 @@ func SyncShared(profileDir, claudeHome string) error {
 	for _, name := range SharedItems {
 		src := filepath.Join(claudeHome, name)
 		fi, err := os.Lstat(src)
+		if err != nil && alwaysShared[name] && os.IsNotExist(err) {
+			if name == "projects" {
+				err = os.MkdirAll(src, 0o700)
+			} else {
+				err = os.WriteFile(src, nil, 0o600)
+			}
+			if err == nil {
+				fi, err = os.Lstat(src)
+			}
+		}
 		if err != nil {
 			continue // missing source — skip cleanly
 		}
@@ -59,13 +76,25 @@ func SyncShared(profileDir, claudeHome string) error {
 			continue
 		}
 		// A pre-existing REAL entry (e.g. per-profile transcripts from before
-		// sharing) is merged into the shared target first — never lose a chat.
+		// sharing) is merged into the shared target first, and what is left
+		// (older copies that lost a name clash) is moved aside — never deleted.
 		if dfi, err := os.Lstat(dst); err == nil && dfi.Mode()&os.ModeSymlink == 0 {
+			if overlaps(dst, target) {
+				return fmt.Errorf("profile: shared %s resolves into this profile's own %s — refusing to merge it into itself (fix the ~/.claude/%s link)", target, dst, name)
+			}
 			if err := mergeInto(dst, target); err != nil {
 				return fmt.Errorf("profile: merge %s into shared %s: %w", dst, target, err)
 			}
+			aside := filepath.Join(profileDir, ".switcch-merged", fmt.Sprintf("%s-%d", name, time.Now().UnixNano()))
+			if err := os.MkdirAll(filepath.Dir(aside), 0o700); err != nil {
+				return err
+			}
+			if err := os.Rename(dst, aside); err != nil {
+				return err
+			}
+		} else if err == nil {
+			_ = os.Remove(dst) // a stale link: remove the link only
 		}
-		_ = os.RemoveAll(dst)
 		if err := os.Symlink(target, dst); err != nil {
 			return err
 		}
@@ -92,6 +121,13 @@ func mergeInto(src, dst string) error {
 		b, err := os.ReadFile(src)
 		if err != nil {
 			return err
+		}
+		if len(b) == 0 {
+			return nil
+		}
+		// Keep the line structure: add a newline if dst doesn't end with one.
+		if cur, err := os.ReadFile(dst); err == nil && len(cur) > 0 && cur[len(cur)-1] != '\n' {
+			b = append([]byte{'\n'}, b...)
 		}
 		f, err := os.OpenFile(dst, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
@@ -135,6 +171,17 @@ func mergeInto(src, dst string) error {
 		}
 	}
 	return nil
+}
+
+// overlaps reports whether a and b resolve to the same path or one contains the other.
+func overlaps(a, b string) bool {
+	ra, err1 := filepath.EvalSymlinks(a)
+	rb, err2 := filepath.EvalSymlinks(b)
+	if err1 != nil || err2 != nil {
+		return true // can't tell: treat as unsafe
+	}
+	in := func(x, y string) bool { return x == y || strings.HasPrefix(x, y+string(filepath.Separator)) }
+	return in(ra, rb) || in(rb, ra)
 }
 
 // ScrubEnv returns env with the auth-override variables removed.

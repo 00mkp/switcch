@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -52,18 +53,41 @@ var (
 	captureBack            = func(a account.Account) { _, _ = credsync.Current(a) }
 	command                = exec.Command
 	claudePath             = func() (string, error) { return exec.LookPath("claude") }
+	claudeHelp             = runHelp
+	childrenOf             = pgrepChildren
 	pollInterval           = 100 * time.Millisecond
 	killGrace              = 5 * time.Second
 	stderr       io.Writer = os.Stderr
 
 	usagePollInterval = 60 * time.Second // proactive: how often the active account's usage is checked
-	notify            = macNotify        // advisory mode
+	notify            = macNotify        // in-session messages (stderr would garble Claude's screen)
 	clock             = time.Now         // idle-time measurement
 	// markerRoot is where cross-chat "account hit a hard limit" markers live
 	// (shared by every switcch session on this machine).
 	markerRoot = func(root string) string { return root }
 	limitedTTL = 30 * time.Minute
+	// earlyExit: a relaunched Claude that dies this soon gets its carried
+	// message printed, so it is never silently lost.
+	earlyExit = 15 * time.Second
 )
+
+func runHelp(bin string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, "--help").Output()
+	return string(out), err
+}
+
+func pgrepChildren(pid int) []int {
+	out, _ := exec.Command("pgrep", "-P", strconv.Itoa(pid)).Output() // exit 1 = none
+	var kids []int
+	for _, f := range strings.Fields(string(out)) {
+		if n, err := strconv.Atoi(f); err == nil {
+			kids = append(kids, n)
+		}
+	}
+	return kids
+}
 
 func macNotify(title, msg string) {
 	q := func(s string) string { return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"` }
@@ -71,7 +95,8 @@ func macNotify(title, msg string) {
 }
 
 // limitedMarker is touched when a chat on a hits a hard limit, so other chats
-// on a arm themselves without waiting for their own usage poll.
+// on a arm themselves without waiting for their own usage poll, and no chat
+// moves back onto a for a while.
 func limitedMarker(root string, a account.Account) string {
 	return filepath.Join(root, fmt.Sprintf("limited-%d", a.Slot))
 }
@@ -100,13 +125,14 @@ func peak(u usage.Usage) float64 {
 	return max(u.FiveHour.Utilization, u.SevenDay.Utilization)
 }
 
-// next returns the first pool account other than active whose usage is below
-// limit (unknown usage counts as available), or nil. Requiring targets to be
-// under the same line that triggered the switch prevents ping-ponging.
-func next(pool []account.Account, active account.Account, usageOf func(account.Account) (usage.Usage, error), limit float64) *account.Account {
+// next returns the first pool account other than active that isn't skipped and
+// whose usage is below limit (unknown usage counts as available), or nil.
+// Requiring targets to be under the same line that triggered the switch, and
+// skipping accounts that recently hit a hard limit, prevents ping-ponging.
+func next(pool []account.Account, active account.Account, usageOf func(account.Account) (usage.Usage, error), limit float64, skip func(account.Account) bool) *account.Account {
 	for i := range pool {
 		a := pool[i]
-		if a.Slot == active.Slot {
+		if a.Slot == active.Slot || skip(a) {
 			continue
 		}
 		if u, err := usageOf(a); err == nil && peak(u) >= limit {
@@ -141,33 +167,10 @@ func decide(e event) action {
 		// The prompt was already blocked by the hook: always relaunch so it is
 		// delivered (on the target, or the same account if there is none).
 		return switchWithPrompt
-	case e.kind == hooks.RateLimited && e.hasTarget && e.mode == "auto":
+	case e.kind == hooks.RateLimited && e.hasTarget && e.mode != "advisory":
 		return switchAcct
 	}
 	return stay
-}
-
-// relaunchArgs keeps the user's own claude flags but replaces any session
-// selection with `--resume <sid> <msg>` (or `--continue <msg>` with no sid).
-func relaunchArgs(orig []string, sid, msg string) []string {
-	var out []string
-	for i := 0; i < len(orig); i++ {
-		a := orig[i]
-		switch a {
-		case "--resume", "-r", "--session-id":
-			if i+1 < len(orig) && !strings.HasPrefix(orig[i+1], "-") {
-				i++
-			}
-			continue
-		case "--continue", "-c", "--fork-session":
-			continue
-		}
-		out = append(out, a)
-	}
-	if sid == "" {
-		return append(out, "--continue", msg)
-	}
-	return append(out, "--resume", sid, msg)
 }
 
 func notice(tmpl string, from, to account.Account) string {
@@ -196,7 +199,7 @@ func take(dir string, k hooks.Kind) (hooks.Signal, bool) {
 }
 
 func clearMarkers(dir string) {
-	for _, f := range []string{hooks.ArmedFile, hooks.BusyFile, string(hooks.RateLimited), string(hooks.Stopped), string(hooks.Intercept)} {
+	for _, f := range []string{hooks.ArmedFile, hooks.BusyFile, hooks.ChildPIDFile, string(hooks.RateLimited), string(hooks.Stopped), string(hooks.Intercept)} {
 		_ = os.Remove(filepath.Join(dir, f))
 	}
 }
@@ -240,41 +243,55 @@ func stopChild(cmd *exec.Cmd, exited <-chan error) {
 	}
 }
 
-// resumeID is the session the user asked to resume (--resume/-r/--session-id <id>), if any.
-func resumeID(args []string) string {
-	for i := 0; i+1 < len(args); i++ {
-		switch args[i] {
-		case "--resume", "-r", "--session-id":
-			if !strings.HasPrefix(args[i+1], "-") {
-				return args[i+1]
-			}
-		}
-	}
-	return ""
-}
-
 // chat is the supervisor's view of the running Claude process.
 type chat struct {
-	o        Options
-	sigDir   string
-	mroot    string
-	active   account.Account
-	sid      string           // last session id seen from a hook
-	armedTo  *account.Account // proactive/limited: switch target once armed
+	o      Options
+	sigDir string
+	mroot  string
+	claude string
+	active account.Account
+	sid    string // last session id seen from a hook (or --resume)
+	pid    int    // the running Claude
+	failed map[int]bool
+
+	spec       optSpec
+	specLoaded bool
+
+	// Per Claude process:
+	armedTo  *account.Account // switch target once armed
 	armedLim float64          // the line that armed it (targets must be under it)
 	idle     time.Time        // when the chat last became idle (clock())
 	lastPoll time.Time
 	notified bool
+	baseline map[int]bool // Claude's child processes when a turn first started (MCP servers)
 }
 
+// move is a decided switch; to is provisional until commit prepares it.
 type move struct {
-	to     account.Account
-	args   []string
-	prompt bool // the message already carries an intercepted prompt
+	to        account.Account
+	limit     float64 // replacement targets must be under this line
+	prompt    string  // intercepted user message(s), sent verbatim
+	hasPrompt bool
 }
 
-func (c *chat) relaunch(to account.Account, msg string) *move {
-	return &move{to: to, args: relaunchArgs(c.o.ClaudeArgs, c.sid, msg)}
+func (c *chat) skip(a account.Account) bool {
+	return c.failed[a.Slot] || limitedRecently(c.mroot, a)
+}
+
+func (c *chat) next(limit float64) *account.Account {
+	return next(c.o.Pool, c.active, usageOf, limit, c.skip)
+}
+
+func (c *chat) optSpec() optSpec {
+	if !c.specLoaded {
+		c.specLoaded = true
+		if txt, err := claudeHelp(c.claude); err == nil {
+			if sp := parseHelp(txt); len(sp) > 0 {
+				c.spec = sp
+			}
+		}
+	}
+	return c.spec
 }
 
 func (c *chat) advise(text string) {
@@ -285,20 +302,39 @@ func (c *chat) advise(text string) {
 }
 
 func (c *chat) arm(limit float64) {
-	if tgt := next(c.o.Pool, c.active, usageOf, limit); tgt != nil {
+	if tgt := c.next(limit); tgt != nil {
 		c.armedTo, c.armedLim = tgt, limit
 		_ = os.WriteFile(filepath.Join(c.sigDir, hooks.ArmedFile), []byte(name(*tgt)), 0o600)
 	}
 }
 
+func (c *chat) disarm() {
+	c.armedTo = nil
+	_ = os.Remove(filepath.Join(c.sigDir, hooks.ArmedFile))
+}
+
 // retarget re-checks an armed target at switch time (its usage may have moved).
 func (c *chat) retarget() *account.Account {
-	tgt := next(c.o.Pool, c.active, usageOf, c.armedLim)
+	tgt := c.next(c.armedLim)
 	if tgt == nil {
-		c.armedTo = nil
-		_ = os.Remove(filepath.Join(c.sigDir, hooks.ArmedFile))
+		c.disarm()
 	}
 	return tgt
+}
+
+// backgroundWork reports whether Claude has child processes it didn't have
+// when its first turn started (a background Bash task or subagent), which a
+// restart would kill.
+func (c *chat) backgroundWork() bool {
+	if c.baseline == nil {
+		return false
+	}
+	for _, p := range childrenOf(c.pid) {
+		if !c.baseline[p] {
+			return true
+		}
+	}
+	return false
 }
 
 // tick processes pending hook signals and timers; non-nil = move the chat.
@@ -311,15 +347,12 @@ func (c *chat) tick() *move {
 	if s, ok := take(c.sigDir, hooks.Intercept); ok {
 		c.sid = cmp.Or(s.SessionID, c.sid)
 		lim := cmp.Or(c.armedLim, 100)
-		tgt := next(c.o.Pool, c.active, usageOf, lim)
+		tgt := c.next(lim)
 		if decide(event{kind: hooks.Intercept, hasTarget: tgt != nil, mode: cfg.Mode}) == switchWithPrompt {
-			if tgt == nil { // hook already blocked it: deliver it here
-				m := c.relaunch(c.active, s.Prompt)
-				m.prompt = true
-				return m
+			m := &move{to: c.active, limit: lim, prompt: s.Prompt, hasPrompt: true}
+			if tgt != nil {
+				m.to = *tgt
 			}
-			m := c.relaunch(*tgt, notice(cfg.Notice, c.active, *tgt)+"\n\n"+s.Prompt)
-			m.prompt = true
 			return m
 		}
 	}
@@ -327,26 +360,33 @@ func (c *chat) tick() *move {
 	if s, ok := take(c.sigDir, hooks.RateLimited); ok {
 		c.sid = cmp.Or(s.SessionID, c.sid)
 		markLimited(c.mroot, c.active)
-		tgt := next(c.o.Pool, c.active, usageOf, 100)
+		tgt := c.next(100)
 		if decide(event{kind: hooks.RateLimited, hasTarget: tgt != nil, mode: cfg.Mode}) == switchAcct {
-			return c.relaunch(*tgt, notice(cfg.Notice, c.active, *tgt))
+			return &move{to: *tgt, limit: 100}
 		}
 		if !auto {
 			c.advise(name(c.active) + " hit its usage limit")
 		}
 		// No viable account: leave Claude showing its limit (ration).
 	}
-	// 3. Turn end: an armed chat moves now, so no turn is ever cut off.
+	busy := exists(filepath.Join(c.sigDir, hooks.BusyFile))
+	if busy && c.baseline == nil {
+		c.baseline = map[int]bool{}
+		for _, p := range childrenOf(c.pid) {
+			c.baseline[p] = true
+		}
+	}
+	// 3. Turn end: an armed chat moves now — unless background work would be
+	// killed, in which case it stays armed and moves on the next prompt.
 	if s, ok := take(c.sigDir, hooks.Stopped); ok {
 		c.sid = cmp.Or(s.SessionID, c.sid)
 		c.idle = now
-		if c.armedTo != nil && auto {
+		if c.armedTo != nil && auto && !c.backgroundWork() {
 			if tgt := c.retarget(); tgt != nil {
-				return c.relaunch(*tgt, notice(cfg.Notice, c.active, *tgt))
+				return &move{to: *tgt, limit: c.armedLim}
 			}
 		}
 	}
-	busy := exists(filepath.Join(c.sigDir, hooks.BusyFile))
 	if busy {
 		c.idle = now
 	}
@@ -372,12 +412,55 @@ func (c *chat) tick() *move {
 	}
 	// 5. Optional: move an armed chat that has sat idle long enough.
 	if c.armedTo != nil && auto && !busy && c.sid != "" && cfg.IdleMigrateMinutes > 0 &&
-		now.Sub(c.idle) >= time.Duration(cfg.IdleMigrateMinutes)*time.Minute {
+		now.Sub(c.idle) >= time.Duration(cfg.IdleMigrateMinutes)*time.Minute && !c.backgroundWork() {
 		if tgt := c.retarget(); tgt != nil {
-			return c.relaunch(*tgt, notice(cfg.Notice, c.active, *tgt))
+			return &move{to: *tgt, limit: c.armedLim}
 		}
 	}
 	return nil
+}
+
+// commit prepares the move's target BEFORE the running Claude is stopped. A
+// target that can't be prepared (e.g. its login broke) is skipped for the rest
+// of the session and the next one is tried; with none left, a carried prompt
+// is delivered on the current account and anything else stays put.
+func (c *chat) commit(m *move) ([]string, bool) {
+	for {
+		if m.to.Slot == c.active.Slot && !m.hasPrompt {
+			return nil, false
+		}
+		_, env, err := prepare(m.to)
+		if err == nil {
+			return env, true
+		}
+		if m.to.Slot == c.active.Slot {
+			return nil, false
+		}
+		notify("switcch", fmt.Sprintf("Can't switch to %s (%v) — skipping it this session", name(m.to), err))
+		c.failed[m.to.Slot] = true
+		if tgt := c.next(m.limit); tgt != nil {
+			m.to = *tgt
+			continue
+		}
+		if !m.hasPrompt {
+			c.disarm()
+			return nil, false
+		}
+		m.to = c.active
+	}
+}
+
+// message is the relaunch's first message: the notice (when changing account)
+// and any carried prompt, verbatim.
+func (c *chat) message(m *move) string {
+	if m.to.Slot == c.active.Slot {
+		return m.prompt
+	}
+	msg := notice(c.o.Config.Notice, c.active, m.to)
+	if m.hasPrompt {
+		msg += "\n\n" + m.prompt
+	}
+	return msg
 }
 
 // Run supervises one chat until the user ends it.
@@ -408,30 +491,40 @@ func Run(ctx context.Context, o Options) error {
 	signal.Notify(term, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(term)
 
-	c := &chat{o: o, sigDir: sigDir, mroot: markerRoot(root), active: o.Pool[0], sid: resumeID(o.ClaudeArgs)}
+	c := &chat{o: o, sigDir: sigDir, mroot: markerRoot(root), claude: claude, active: o.Pool[0],
+		sid: resumeID(o.ClaudeArgs), failed: map[int]bool{}}
+	_, env, err := prepare(c.active)
+	if err != nil {
+		return err
+	}
 	args := o.ClaudeArgs
+	var carried string // user message(s) handed to the current Claude via argv
+	var movedAt time.Time
 	for {
-		_, env, err := prepare(c.active)
-		if err != nil {
-			return err
-		}
 		clearMarkers(sigDir)
-		c.armedTo, c.armedLim, c.notified, c.lastPoll, c.idle = nil, 0, false, time.Time{}, clock()
+		c.armedTo, c.armedLim, c.notified, c.lastPoll, c.idle, c.baseline = nil, 0, false, time.Time{}, clock(), nil
 		cmd := command(claude, args...)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 		cmd.Env = childEnv(env, sigDir)
 		if err := cmd.Start(); err != nil {
 			return err
 		}
+		c.pid = cmd.Process.Pid
+		_ = os.WriteFile(filepath.Join(sigDir, hooks.ChildPIDFile), []byte(strconv.Itoa(c.pid)), 0o600)
 		exited := make(chan error, 1)
 		go func() { exited <- cmd.Wait() }()
 
 		var m *move
+		var nextEnv []string
 		for m == nil {
 			select {
 			case err := <-exited:
 				captureBack(c.active)
-				return exitErr(err)
+				e := exitErr(err)
+				if e != nil && carried != "" && time.Since(movedAt) < earlyExit {
+					fmt.Fprintf(stderr, "\nswitcch: Claude exited right after this chat moved to %s, so your message may not have been sent. Here it is:\n\n%s\n\n", name(c.active), carried)
+				}
+				return e
 			case s := <-term:
 				_ = cmd.Process.Signal(s)
 				<-exited
@@ -442,19 +535,38 @@ func Run(ctx context.Context, o Options) error {
 				captureBack(c.active)
 				return ctx.Err()
 			case <-time.After(pollInterval):
-				m = c.tick()
+				mv := c.tick()
+				if mv == nil {
+					continue
+				}
+				if e, ok := c.commit(mv); ok {
+					m, nextEnv = mv, e
+				} else if mv.hasPrompt {
+					notify("switcch", "Couldn't deliver your message — please send it again: "+mv.prompt)
+				}
 			}
 		}
 
-		fmt.Fprintf(stderr, "\nswitcch: moving this chat %s → %s…\n", name(c.active), name(m.to))
+		// Arm before stopping, so a message typed while Claude shuts down is
+		// blocked by the hook and handed over rather than lost.
+		_ = os.WriteFile(filepath.Join(sigDir, hooks.ArmedFile), []byte(name(m.to)), 0o600)
+		if m.to.Slot != c.active.Slot {
+			fmt.Fprintf(stderr, "\nswitcch: moving this chat %s → %s…\n", name(c.active), name(m.to))
+		}
 		stopChild(cmd, exited)
-		// A message the user sent while we were stopping Claude was blocked by
-		// the (armed) hook: carry it over rather than lose it.
-		if s, ok := take(sigDir, hooks.Intercept); ok && !m.prompt {
-			m.args[len(m.args)-1] += "\n\n" + s.Prompt
+		if s, ok := take(sigDir, hooks.Intercept); ok {
+			if m.hasPrompt {
+				m.prompt += "\n\n" + s.Prompt
+			} else {
+				m.prompt, m.hasPrompt = s.Prompt, true
+			}
 		}
 		captureBack(c.active)
-		c.active = m.to
-		args = m.args
+		carried, movedAt = "", time.Now()
+		if m.hasPrompt {
+			carried = m.prompt
+		}
+		args = relaunchArgs(o.ClaudeArgs, c.optSpec(), c.sid, c.message(m))
+		c.active, env = m.to, nextEnv
 	}
 }

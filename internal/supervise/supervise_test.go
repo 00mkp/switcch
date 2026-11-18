@@ -6,12 +6,15 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -36,15 +39,20 @@ func usageMap(m map[int]float64) func(account.Account) (usage.Usage, error) {
 
 func TestNextSkipsExhaustedAndPins(t *testing.T) {
 	pool := []account.Account{work, personal, other}
-	got := next(pool, work, usageMap(map[int]float64{2: 100, 3: 10}), 100)
+	none := func(account.Account) bool { return false }
+	got := next(pool, work, usageMap(map[int]float64{2: 100, 3: 10}), 100, none)
 	if got == nil || got.Slot != other.Slot {
 		t.Fatalf("next = %+v, want other (personal is exhausted)", got)
 	}
-	if got := next([]account.Account{personal}, personal, usageMap(nil), 100); got != nil {
+	if got := next([]account.Account{personal}, personal, usageMap(nil), 100, none); got != nil {
 		t.Fatalf("a pin has no next account, got %+v", got)
 	}
-	if got := next(pool, work, usageMap(map[int]float64{2: 95, 3: 95}), 90); got != nil {
+	if got := next(pool, work, usageMap(map[int]float64{2: 95, 3: 95}), 90, none); got != nil {
 		t.Fatalf("proactive limit must exclude accounts already over it, got %+v", got)
+	}
+	skipPersonal := func(a account.Account) bool { return a.Slot == personal.Slot }
+	if got := next(pool, work, usageMap(nil), 100, skipPersonal); got == nil || got.Slot != other.Slot {
+		t.Fatalf("a skipped (recently limited / unusable) account must not be chosen, got %+v", got)
 	}
 }
 
@@ -56,6 +64,7 @@ func TestDecide(t *testing.T) {
 		{event{kind: hooks.RateLimited, hasTarget: true, mode: "auto"}, switchAcct},
 		{event{kind: hooks.RateLimited, hasTarget: false, mode: "auto"}, stay},
 		{event{kind: hooks.RateLimited, hasTarget: true, mode: "advisory"}, stay},
+		{event{kind: hooks.RateLimited, hasTarget: true, mode: ""}, switchAcct}, // one predicate for "auto"
 		{event{kind: hooks.Intercept, hasTarget: true, mode: "auto"}, switchWithPrompt},
 		{event{exited: true}, done},
 	}
@@ -66,15 +75,61 @@ func TestDecide(t *testing.T) {
 	}
 }
 
-func TestRelaunchArgsStripsSessionFlags(t *testing.T) {
-	got := relaunchArgs([]string{"--model", "opus", "--resume", "old-id", "--continue", "-c"}, "sid-9", "hello")
-	want := []string{"--model", "opus", "--resume", "sid-9", "hello"}
+const sampleHelp = `Usage: claude [options] [command] [prompt]
+
+Options:
+  --add-dir <directories...>            More directories Claude can access
+  --model <model>                       Model for the current session
+  -c, --continue                        Continue the most recent conversation
+  -d, --debug [filter]                  Enable debug mode
+  -r, --resume [value]                  Resume a conversation
+  --session-id <uuid>                   Use a specific session ID
+  --fork-session                        When resuming, create a new session ID
+  --allowedTools, --allowed-tools <tools...>
+  --verbose                             Override verbose mode
+`
+
+func TestParseHelp(t *testing.T) {
+	sp := parseHelp(sampleHelp)
+	want := map[string]arity{"--add-dir": variadic, "--model": required, "-c": none, "--continue": none,
+		"-d": optional, "-r": optional, "--resume": optional, "--allowed-tools": variadic, "--allowedTools": variadic, "--verbose": none}
+	for k, v := range want {
+		if sp[k] != v {
+			t.Errorf("%s arity = %v, want %v", k, sp[k], v)
+		}
+	}
+}
+
+func TestRelaunchArgs(t *testing.T) {
+	sp := parseHelp(sampleHelp)
+	got := relaunchArgs([]string{"--model", "opus", "commit and push", "--resume", "old-id", "--add-dir", "a", "b", "-c", "--verbose"}, sp, "sid-9", "- hello")
+	want := []string{"--model", "opus", "--add-dir", "a", "b", "--verbose", "--resume", "sid-9", "--", "- hello"}
 	if !slices.Equal(got, want) {
-		t.Fatalf("relaunchArgs = %v, want %v", got, want)
+		t.Fatalf("relaunchArgs =\n %q\nwant\n %q", got, want)
 	}
-	if got := relaunchArgs(nil, "", "hi"); !slices.Equal(got, []string{"--continue", "hi"}) {
-		t.Fatalf("no session id should fall back to --continue, got %v", got)
+	// Everything after the user's own "--" is positional: dropped.
+	if got := relaunchArgs([]string{"--verbose", "--", "--model"}, sp, "s", "m"); !slices.Equal(got, []string{"--verbose", "--resume", "s", "--", "m"}) {
+		t.Fatalf("after --: %q", got)
 	}
+	if got := relaunchArgs([]string{"--model=opus", "hi"}, sp, "s", "m"); !slices.Equal(got, []string{"--model=opus", "--resume", "s", "--", "m"}) {
+		t.Fatalf("--flag=value: %q", got)
+	}
+	if got := relaunchArgs(nil, sp, "", "hi"); !slices.Equal(got, []string{"--continue", "--", "hi"}) {
+		t.Fatalf("no session id should fall back to --continue, got %q", got)
+	}
+	// Unknown option table (claude --help failed): keep nothing but the resume.
+	if got := relaunchArgs([]string{"--model", "opus", "do X"}, nil, "s", "m"); !slices.Equal(got, []string{"--resume", "s", "--", "m"}) {
+		t.Fatalf("without a flag table nothing of the user's args may be guessed at: %q", got)
+	}
+}
+
+// resumeOf parses "... --resume <sid> -- <msg>" (the msg must be last).
+func resumeOf(a []string) (sid, msg string, ok bool) {
+	i := slices.Index(a, "--resume")
+	if i < 0 || i+3 != len(a)-1 || a[i+2] != "--" {
+		return "", "", false
+	}
+	return a[i+1], a[i+3], true
 }
 
 // ---- fake claude ----
@@ -83,10 +138,12 @@ type launchRec struct {
 	Args      []string `json:"args"`
 	ConfigDir string   `json:"config_dir"`
 	Watchdog  string   `json:"watchdog"`
+	PIDFileOK bool     `json:"pid_file_ok"`
 }
 
-// TestHelperProcess is the fake `claude`. Launch 1 emits the configured signal
-// (as the hook would) and blocks until SIGTERM; later launches exit at once.
+// TestHelperProcess is the fake ` + "`claude`" + `. FAKE_ACT applies to launch 1
+// (or every launch with an "-always" suffix): emit a hook signal, then block
+// until SIGTERM or FAKE_WAIT. Other launches exit at once (FAKE_EXIT_LATER code).
 func TestHelperProcess(t *testing.T) {
 	if os.Getenv("SWITCCH_FAKE_CLAUDE") != "1" {
 		return
@@ -98,17 +155,26 @@ func TestHelperProcess(t *testing.T) {
 			break
 		}
 	}
+	dir := os.Getenv("SWITCCH_SIGNAL_DIR")
+	pidOK := false
+	for i := 0; i < 40 && !pidOK; i++ { // the supervisor writes it right after Start
+		b, _ := os.ReadFile(filepath.Join(dir, hooks.ChildPIDFile))
+		pidOK = strings.TrimSpace(string(b)) == strconv.Itoa(os.Getpid())
+		if !pidOK {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
 	logp := os.Getenv("FAKE_LOG")
-	rec, _ := json.Marshal(launchRec{Args: args, ConfigDir: os.Getenv("CLAUDE_CONFIG_DIR"), Watchdog: os.Getenv("CLAUDE_CODE_RETRY_WATCHDOG")})
+	rec, _ := json.Marshal(launchRec{Args: args, ConfigDir: os.Getenv("CLAUDE_CONFIG_DIR"), Watchdog: os.Getenv("CLAUDE_CODE_RETRY_WATCHDOG"), PIDFileOK: pidOK})
 	f, _ := os.OpenFile(logp, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	f.Write(append(rec, '\n'))
 	f.Close()
 	n := countLines(logp)
-	if n == 1 && os.Getenv("FAKE_ACT") != "none" {
+	act, always := strings.CutSuffix(os.Getenv("FAKE_ACT"), "-always")
+	if (n == 1 || always) && act != "none" {
 		term := make(chan os.Signal, 1)
 		signal.Notify(term, syscall.SIGTERM)
-		dir := os.Getenv("SWITCCH_SIGNAL_DIR")
-		switch os.Getenv("FAKE_ACT") {
+		switch act {
 		case "ratelimit":
 			hooks.WriteSignal(dir, hooks.Signal{Kind: hooks.RateLimited, SessionID: "sid-1"})
 		case "intercept":
@@ -120,8 +186,19 @@ func TestHelperProcess(t *testing.T) {
 		}
 		select {
 		case <-term:
+			// The user typed while we were being stopped: the (armed) hook
+			// would block it and hand it over.
+			if p := os.Getenv("FAKE_TERM_PROMPT"); p != "" {
+				if _, err := os.Stat(filepath.Join(dir, hooks.ArmedFile)); err == nil {
+					hooks.WriteSignal(dir, hooks.Signal{Kind: hooks.Intercept, SessionID: "sid-1", Prompt: p})
+				}
+			}
 		case <-time.After(wait):
 		}
+		os.Exit(0)
+	}
+	if c, err := strconv.Atoi(os.Getenv("FAKE_EXIT_LATER")); err == nil {
+		os.Exit(c)
 	}
 	os.Exit(0)
 }
@@ -157,33 +234,72 @@ func readLaunches(t *testing.T, p string) []launchRec {
 	return out
 }
 
-func runFake(t *testing.T, act, prompt string, pool []account.Account) []launchRec {
+type fake struct {
+	act, prompt, termPrompt string
+	exitLater               int
+	pool                    []account.Account
+	prepareFail             map[string]bool
+	claudeArgs              []string
+	mode                    string
+}
+
+// fakeSeams points the supervisor at the fake claude; returns the log path.
+func fakeSeams(t *testing.T, f fake, extraEnv ...string) string {
 	t.Helper()
 	logp := filepath.Join(t.TempDir(), "launches.jsonl")
-	o1, o2, o3, o4, o5, o6 := prepare, usageOf, captureBack, command, claudePath, pollInterval
-	t.Cleanup(func() { prepare, usageOf, captureBack, command, claudePath, pollInterval = o1, o2, o3, o4, o5, o6 })
+	o1, o2, o3, o4, o5, o6, o7, o8, o9 := prepare, usageOf, captureBack, command, claudePath, pollInterval, claudeHelp, stderr, childrenOf
+	t.Cleanup(func() {
+		prepare, usageOf, captureBack, command, claudePath, pollInterval, claudeHelp, stderr, childrenOf = o1, o2, o3, o4, o5, o6, o7, o8, o9
+	})
 	prepare = func(a account.Account) (string, []string, error) {
+		if f.prepareFail[a.Alias] {
+			return "", nil, errors.New("invalid_grant")
+		}
 		dir := "/profiles/" + a.Alias
-		return dir, []string{
+		return dir, append([]string{
 			"CLAUDE_CONFIG_DIR=" + dir, "CLAUDE_CODE_RETRY_WATCHDOG=1",
-			"SWITCCH_FAKE_CLAUDE=1", "FAKE_LOG=" + logp, "FAKE_ACT=" + act, "FAKE_PROMPT=" + prompt,
-			"FAKE_WAIT=300ms",
-		}, nil
+			"SWITCCH_FAKE_CLAUDE=1", "FAKE_LOG=" + logp, "FAKE_ACT=" + f.act, "FAKE_PROMPT=" + f.prompt,
+			"FAKE_TERM_PROMPT=" + f.termPrompt, "FAKE_EXIT_LATER=" + strconv.Itoa(f.exitLater),
+		}, extraEnv...), nil
 	}
 	usageOf = usageMap(nil)
 	captureBack = func(account.Account) {}
 	claudePath = func() (string, error) { return os.Args[0], nil }
+	claudeHelp = func(string) (string, error) { return sampleHelp, nil }
+	childrenOf = func(int) []int { return nil }
 	command = func(name string, args ...string) *exec.Cmd {
 		return exec.Command(name, append([]string{"-test.run=TestHelperProcess", "--"}, args...)...)
 	}
 	pollInterval = 10 * time.Millisecond
+	return logp
+}
 
+func runFakeErr(t *testing.T, f fake) ([]launchRec, string, error) {
+	t.Helper()
+	logp := fakeSeams(t, f, "FAKE_WAIT=300ms")
+	var errBuf strings.Builder
+	stderr = &errBuf
+	on := notify
+	t.Cleanup(func() { notify = on })
+	notify = func(_, msg string) { errBuf.WriteString("[notify] " + msg + "\n") }
 	cfg := config.Defaults()
-	err := Run(context.Background(), Options{Pool: pool, Config: cfg, RuntimeDir: t.TempDir()})
+	if f.mode != "" {
+		cfg.Mode = f.mode
+	}
+	// A deadline turns a relaunch loop into a failure instead of a hung test.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := Run(ctx, Options{Pool: f.pool, Config: cfg, ClaudeArgs: f.claudeArgs, RuntimeDir: t.TempDir()})
+	return readLaunches(t, logp), errBuf.String(), err
+}
+
+func runFake(t *testing.T, act, prompt string, pool []account.Account) []launchRec {
+	t.Helper()
+	l, _, err := runFakeErr(t, fake{act: act, prompt: prompt, pool: pool})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	return readLaunches(t, logp)
+	return l
 }
 
 func TestRunRateLimitFailsOverToSameConversation(t *testing.T) {
@@ -194,30 +310,47 @@ func TestRunRateLimitFailsOverToSameConversation(t *testing.T) {
 	if l[1].ConfigDir != "/profiles/personal" {
 		t.Fatalf("relaunch should be on personal's profile, got %q", l[1].ConfigDir)
 	}
-	a := l[1].Args
-	if len(a) < 3 || a[len(a)-3] != "--resume" || a[len(a)-2] != "sid-1" {
-		t.Fatalf("relaunch must resume the same session, got %v", a)
+	sid, msg, ok := resumeOf(l[1].Args)
+	if !ok || sid != "sid-1" {
+		t.Fatalf("relaunch must resume the same session, got %v", l[1].Args)
 	}
-	if msg := a[len(a)-1]; !strings.Contains(msg, "work") || !strings.Contains(msg, "personal") {
+	if !strings.Contains(msg, "work") || !strings.Contains(msg, "personal") {
 		t.Fatalf("notice should name both accounts, got %q", msg)
 	}
 	if l[0].Watchdog != "" || l[1].Watchdog != "" {
 		t.Fatal("CLAUDE_CODE_RETRY_WATCHDOG must be unset in the child (it can suppress StopFailure)")
 	}
+	if !l[0].PIDFileOK || !l[1].PIDFileOK {
+		t.Fatal("the supervisor must record each child's pid for the hook's ancestry check")
+	}
 }
 
 func TestRunInterceptCarriesPromptVerbatim(t *testing.T) {
-	prompt := "line one\nwith \"quotes\" and unicode ✓"
+	prompt := "- line one\nwith \"quotes\" and unicode ✓"
 	l := runFake(t, "intercept", prompt, []account.Account{work, personal})
 	if len(l) != 2 {
 		t.Fatalf("want 2 launches, got %d", len(l))
 	}
-	last := l[1].Args[len(l[1].Args)-1]
-	if !strings.HasSuffix(last, "\n\n"+prompt) {
-		t.Fatalf("intercepted prompt must arrive verbatim after the notice, got %q", last)
+	_, msg, ok := resumeOf(l[1].Args)
+	if !ok || !strings.HasSuffix(msg, "\n\n"+prompt) {
+		t.Fatalf("intercepted prompt must arrive verbatim after the notice (and after --), got %q", l[1].Args)
 	}
 	if l[1].ConfigDir != "/profiles/personal" {
 		t.Fatalf("intercept should move to personal, got %q", l[1].ConfigDir)
+	}
+}
+
+func TestRunDoesNotReplayLaunchPrompt(t *testing.T) {
+	l, _, err := runFakeErr(t, fake{act: "ratelimit", pool: []account.Account{work, personal},
+		claudeArgs: []string{"--model", "opus", "commit and push the fix"}})
+	if err != nil || len(l) != 2 {
+		t.Fatalf("err=%v launches=%d", err, len(l))
+	}
+	if slices.Contains(l[1].Args, "commit and push the fix") {
+		t.Fatalf("the launch prompt must not be re-sent on relaunch: %q", l[1].Args)
+	}
+	if !slices.Contains(l[1].Args, "opus") {
+		t.Fatalf("the user's flags must be kept: %q", l[1].Args)
 	}
 }
 
@@ -229,11 +362,87 @@ func TestRunUserExitEndsWithNoRelaunch(t *testing.T) {
 }
 
 func TestRunPinnedRateLimitDoesNotLoop(t *testing.T) {
-	// A pin has nowhere to go: the limit signal must not cause a relaunch; Claude
-	// keeps showing its limit until it exits on its own.
 	l := runFake(t, "ratelimit", "", []account.Account{personal})
 	if len(l) != 1 {
 		t.Fatalf("a pinned chat must not be relaunched on a limit, got %d launches", len(l))
+	}
+}
+
+func TestRunHardLimitsEverywhereDoNotPingPong(t *testing.T) {
+	// Both accounts reject every turn (e.g. a model cap the 5h/7d numbers don't
+	// show): one move, then stay — never bounce back to the account that just failed.
+	l, _, err := runFakeErr(t, fake{act: "ratelimit-always", pool: []account.Account{work, personal}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(l) != 2 {
+		t.Fatalf("want exactly one move then stay, got %d launches", len(l))
+	}
+}
+
+func TestRunTargetThatCannotPrepareIsSkipped(t *testing.T) {
+	// personal's login is broken: a hard limit on work must keep work's Claude
+	// running (not kill it first) and fall through to the next pool account.
+	l, errOut, err := runFakeErr(t, fake{act: "ratelimit", pool: []account.Account{work, personal, other},
+		prepareFail: map[string]bool{"personal": true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(l) != 2 || l[1].ConfigDir != "/profiles/other" {
+		t.Fatalf("want a move to other, got %+v", l)
+	}
+	if !strings.Contains(errOut, "personal") {
+		t.Fatalf("the skipped account should be reported, stderr=%q", errOut)
+	}
+	// No viable target at all: stay on work, Claude untouched.
+	l, _, err = runFakeErr(t, fake{act: "ratelimit", pool: []account.Account{work, personal},
+		prepareFail: map[string]bool{"personal": true}})
+	if err != nil || len(l) != 1 {
+		t.Fatalf("no preparable target ⇒ stay: err=%v launches=%d", err, len(l))
+	}
+}
+
+func TestRunInterceptWithUnpreparableTargetDeliversHere(t *testing.T) {
+	l, _, err := runFakeErr(t, fake{act: "intercept", prompt: "hello", pool: []account.Account{work, personal},
+		prepareFail: map[string]bool{"personal": true}})
+	if err != nil || len(l) != 2 || l[1].ConfigDir != "/profiles/work" {
+		t.Fatalf("the blocked prompt must be delivered on the current account: err=%v %+v", err, l)
+	}
+	if _, msg, ok := resumeOf(l[1].Args); !ok || msg != "hello" {
+		t.Fatalf("message = %q (no notice when not moving)", l[1].Args)
+	}
+}
+
+func TestRunEarlyRelaunchFailurePrintsCarriedPrompt(t *testing.T) {
+	_, errOut, err := runFakeErr(t, fake{act: "intercept", prompt: "my precious message", exitLater: 1,
+		pool: []account.Account{work, personal}})
+	var ee *ExitError
+	if !errors.As(err, &ee) || ee.Code != 1 {
+		t.Fatalf("want claude's exit status, got %v", err)
+	}
+	if !strings.Contains(errOut, "my precious message") {
+		t.Fatalf("a prompt carried into a relaunch that died must be shown to the user, stderr=%q", errOut)
+	}
+}
+
+func TestRunPromptTypedWhileStoppingIsCarried(t *testing.T) {
+	// Hard-limit move: the user types while Claude is being stopped. The
+	// supervisor must have armed the hook (so it blocks + hands over the prompt)
+	// and the relaunch must carry it.
+	l, _, err := runFakeErr(t, fake{act: "ratelimit", termPrompt: "typed during stop", pool: []account.Account{work, personal}})
+	if err != nil || len(l) != 2 {
+		t.Fatalf("err=%v launches=%d", err, len(l))
+	}
+	if _, msg, _ := resumeOf(l[1].Args); !strings.HasSuffix(msg, "\n\ntyped during stop") {
+		t.Fatalf("prompt typed during the stop was lost: %q", l[1].Args)
+	}
+	// Intercept move plus a second prompt during the stop: both arrive, in order.
+	l, _, err = runFakeErr(t, fake{act: "intercept", prompt: "first", termPrompt: "second", pool: []account.Account{work, personal}})
+	if err != nil || len(l) != 2 {
+		t.Fatalf("err=%v launches=%d", err, len(l))
+	}
+	if _, msg, _ := resumeOf(l[1].Args); !strings.HasSuffix(msg, "first\n\nsecond") {
+		t.Fatalf("both prompts must be carried in order: %q", l[1].Args)
 	}
 }
 
@@ -247,27 +456,18 @@ type step struct {
 
 func scripted(t *testing.T, cfg config.Config, pool []account.Account, util map[int]float64, steps []step) (launches []launchRec, polls int, notes []string, root string) {
 	t.Helper()
-	logp := filepath.Join(t.TempDir(), "launches.jsonl")
 	root = t.TempDir()
-	o := []any{prepare, usageOf, captureBack, command, claudePath, pollInterval, usagePollInterval, notify, clock}
-	t.Cleanup(func() {
-		prepare, usageOf, captureBack, command, claudePath = o[0].(func(account.Account) (string, []string, error)), o[1].(func(account.Account) (usage.Usage, error)), o[2].(func(account.Account)), o[3].(func(string, ...string) *exec.Cmd), o[4].(func() (string, error))
-		pollInterval, usagePollInterval, notify, clock = o[5].(time.Duration), o[6].(time.Duration), o[7].(func(string, string)), o[8].(func() time.Time)
-	})
-	prepare = func(a account.Account) (string, []string, error) {
-		dir := "/profiles/" + a.Alias
-		return dir, []string{"CLAUDE_CONFIG_DIR=" + dir, "SWITCCH_FAKE_CLAUDE=1", "FAKE_LOG=" + logp, "FAKE_ACT=block", "FAKE_WAIT=700ms"}, nil
+	logp := fakeSeams(t, fake{act: "block"}, "FAKE_WAIT=700ms")
+	o1, o2, o3 := usagePollInterval, notify, clock
+	t.Cleanup(func() { usagePollInterval, notify, clock = o1, o2, o3 })
+	if scriptedChildren != nil {
+		childrenOf = scriptedChildren
 	}
 	usageOf = func(a account.Account) (usage.Usage, error) {
 		if a.Slot == pool[0].Slot {
 			polls++
 		}
 		return usage.Usage{FiveHour: usage.Window{Utilization: util[a.Slot]}}, nil
-	}
-	captureBack = func(account.Account) {}
-	claudePath = func() (string, error) { return os.Args[0], nil }
-	command = func(name string, args ...string) *exec.Cmd {
-		return exec.Command(name, append([]string{"-test.run=TestHelperProcess", "--"}, args...)...)
 	}
 	pollInterval = 5 * time.Millisecond
 	usagePollInterval = 20 * time.Millisecond
@@ -291,8 +491,11 @@ func scripted(t *testing.T, cfg config.Config, pool []account.Account, util map[
 	return readLaunches(t, logp), polls, notes, root
 }
 
-// scriptedArgs are the user's claude args for the next scripted run.
-var scriptedArgs []string
+// scriptedArgs / scriptedChildren customise the next scripted run.
+var (
+	scriptedArgs     []string
+	scriptedChildren func(int) []int
+)
 
 func busy(dir string) { _ = os.WriteFile(filepath.Join(dir, hooks.BusyFile), nil, 0o600) }
 func stopped(dir string) {
@@ -308,9 +511,8 @@ func TestProactiveSwitchesAtTurnEnd(t *testing.T) {
 	if len(l) != 2 || l[1].ConfigDir != "/profiles/personal" {
 		t.Fatalf("proactive+auto must switch at turn end, got %+v", l)
 	}
-	a := l[1].Args
-	if a[len(a)-3] != "--resume" || a[len(a)-2] != "sid-1" {
-		t.Fatalf("must resume the same chat, got %v", a)
+	if sid, _, ok := resumeOf(l[1].Args); !ok || sid != "sid-1" {
+		t.Fatalf("must resume the same chat, got %v", l[1].Args)
 	}
 }
 
@@ -351,8 +553,8 @@ func TestIdleMigrateAfterMinutes(t *testing.T) {
 	if len(l) != 2 || l[1].ConfigDir != "/profiles/personal" {
 		t.Fatalf("armed + idle past idleMigrateMinutes must switch, got %+v", l)
 	}
-	if a := l[1].Args; a[len(a)-3] != "--resume" || a[len(a)-2] != "sid-1" {
-		t.Fatalf("idle migration must resume the same chat, got %v", a)
+	if sid, _, ok := resumeOf(l[1].Args); !ok || sid != "sid-1" {
+		t.Fatalf("idle migration must resume the same chat, got %v", l[1].Args)
 	}
 	c.IdleMigrateMinutes = 0
 	l, _, _, _ = scripted(t, c, []account.Account{work, personal}, map[int]float64{1: 91}, nil)
@@ -419,7 +621,29 @@ func TestPromptSubmittedDuringSwitchIsNotLost(t *testing.T) {
 			stopped(d)
 			_ = hooks.WriteSignal(d, hooks.Signal{Kind: hooks.Intercept, SessionID: "sid-1", Prompt: "late msg"})
 		}}})
-	if len(l) != 2 || !strings.HasSuffix(l[1].Args[len(l[1].Args)-1], "\n\nlate msg") {
+	if _, msg, ok := resumeOf(l[1].Args); len(l) != 2 || !ok || !strings.HasSuffix(msg, "\n\nlate msg") {
 		t.Fatalf("late prompt must be delivered on the new account, got %+v", l)
+	}
+}
+
+func TestTurnEndSwitchWaitsForBackgroundWork(t *testing.T) {
+	// A background task the turn started (a new child process of Claude) is
+	// still running when the turn ends: don't kill it — stay armed, so the next
+	// prompt moves the chat instead.
+	var mu sync.Mutex
+	kids := []int{11} // an MCP server, present when the turn started
+	scriptedChildren = func(int) []int { mu.Lock(); defer mu.Unlock(); return slices.Clone(kids) }
+	t.Cleanup(func() { scriptedChildren = nil })
+	var armed string
+	l, _, _, _ := scripted(t, proactive(), []account.Account{work, personal}, map[int]float64{1: 91},
+		[]step{{10 * time.Millisecond, busy},
+			{50 * time.Millisecond, func(string) { mu.Lock(); kids = append(kids, 22); mu.Unlock() }},
+			{50 * time.Millisecond, stopped},
+			{100 * time.Millisecond, func(d string) { b, _ := os.ReadFile(filepath.Join(d, hooks.ArmedFile)); armed = string(b) }}})
+	if len(l) != 1 {
+		t.Fatalf("turn-end switch must wait while background work runs, got %d launches", len(l))
+	}
+	if armed != "personal" {
+		t.Fatalf("the chat must stay armed for its next prompt, armed=%q", armed)
 	}
 }
