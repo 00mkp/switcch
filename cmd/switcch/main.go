@@ -461,6 +461,15 @@ func run(args []string) error {
 }
 
 func main() {
+	// Hook entry point: dispatched before anything else so it stays fast and is
+	// inert (exit 0) outside switcch sessions.
+	if len(os.Args) >= 3 && os.Args[1] == "__hook" {
+		code, msg := hooks.HandleHook(os.Args[2], os.Stdin, os.Getenv)
+		if msg != "" {
+			fmt.Fprintln(os.Stderr, msg)
+		}
+		os.Exit(code)
+	}
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "switcch: "+err.Error())
 		os.Exit(1)
