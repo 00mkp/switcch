@@ -190,6 +190,9 @@ func TestClassifyModelCap(t *testing.T) {
 		{"sonnet weekly cap", map[string]any{"error": "error", "last_assistant_message": "Sonnet weekly limit reached"}, "sonnet"},
 		{"account-wide 429 naming a model", map[string]any{"error": "rate_limit", "error_details": "429 Too Many Requests (model: claude-opus-4)"}, ""},
 		{"plain session limit", map[string]any{"error": "error", "last_assistant_message": "You've hit your session limit"}, ""},
+		{"versioned model name", map[string]any{"error": "error", "last_assistant_message": "You've hit your Opus 4.1 limit · resets 9pm"}, "opus"},
+		{"model limit reached form", map[string]any{"error": "error", "last_assistant_message": "Opus limit reached, resets Mon"}, "opus"},
+		{"prose that names a model limit", map[string]any{"error": "rate_limit", "error_details": "429 Too Many Requests (model: claude-opus-4)", "last_assistant_message": "I bumped the Opus limit check in config.go"}, ""},
 	}
 	for _, c := range cases {
 		s := Classify("StopFailure", payload(c.p))

@@ -1,6 +1,7 @@
 package hooks
 
 import (
+	"cmp"
 	"encoding/json"
 	"io"
 	"os"
@@ -90,7 +91,10 @@ var (
 
 // modelCap finds a model-specific cap ("Opus limit", "Sonnet weekly limit")
 // in a limit message; a model merely named elsewhere doesn't count.
-var modelCap = regexp.MustCompile(`\b(opus|sonnet|haiku)(?: weekly)? limit\b`)
+// Only limit-message phrasing counts ("hit/reached your Opus 4.1 limit",
+// "Sonnet weekly limit reached/resets …"), so prose like "the Opus limit
+// check" does not.
+var modelCap = regexp.MustCompile(`(?:hit|reached) your (opus|sonnet|haiku)(?: \d[\d.]*)?(?: weekly)? limit|\b(opus|sonnet|haiku)(?: \d[\d.]*)?(?: weekly)? limit (?:reached|resets|will reset|·)`)
 
 func containsAny(s string, subs []string) bool {
 	for _, x := range subs {
@@ -115,13 +119,15 @@ func Classify(event string, raw []byte) Signal {
 		if containsAny(text, foreignMarkers) || containsAny(text, denylist) {
 			return Signal{}
 		}
+		cap := modelCap.FindStringSubmatch(text)
 		limited := p.Error == "rate_limit" ||
+			cap != nil ||
 			containsAny(text, strongPhrases) ||
 			(containsAny(text, weakPhrases) && containsAny(text, apiContext))
 		if limited {
 			sig := Signal{Kind: RateLimited, SessionID: p.SessionID}
-			if m := modelCap.FindStringSubmatch(text); m != nil {
-				sig.Model = m[1]
+			if cap != nil {
+				sig.Model = cmp.Or(cap[1], cap[2])
 			}
 			return sig
 		}
