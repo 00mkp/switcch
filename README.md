@@ -58,7 +58,7 @@ Anything after `--` goes to `claude` unchanged.
 
 ## How failover works
 
-- **Before the limit (default).** switcch checks the active account's usage every minute. Past 90% of its 5-hour or 7-day window, the chat is marked to move: a running turn finishes first, then the chat continues on the fallback account. An idle chat moves when you send your next message, and that message goes to the new account word for word.
+- **Before the limit (default).** switcch checks the active account's usage about once a minute (readings are shared between chats, so one can be a few minutes old). Past 90% of its 5-hour or 7-day window, the chat is marked to move: a running turn finishes first, then the chat continues on the fallback account. An idle chat moves when you send your next message, and that message goes to the new account word for word.
 - **At the limit.** If an account hits its limit anyway, the chat moves at once. Other chats on that account move on their next message.
 - **Same conversation.** switcch restarts Claude with `--resume` on the new account, with a short note as the first message, e.g. `[switcch] work hit its usage limit — continuing on personal.`
 - **Model caps.** If only one model is capped (say Opus), the chat first continues on Sonnet on the same account, and only switches accounts if that is capped too.
@@ -98,6 +98,7 @@ Config lives in `~/.config/switcch/config.json`.
       "slot": 1, "email": "you@work.com", "alias": "work", "limited": false,
       "fiveHour": {"utilization": 42, "resetsAt": "2026-11-18T19:00:00Z"},
       "sevenDay": {"utilization": 63, "resetsAt": "2026-11-21T08:00:00Z"},
+      "models": [{"model": "Opus", "percent": 80, "active": true}],
       "sessions": [
         {"pid": 4242, "cwd": "/Users/you/code", "started": "2026-11-18T15:02:11Z",
          "sessionId": "6f1c…", "pool": [1, 2]}
@@ -107,7 +108,9 @@ Config lives in `~/.config/switcch/config.json`.
 }
 ```
 
-`limited` is true when a chat on that account hit a hard limit in the last 30 minutes. `pool` lists the chat's accounts (by slot) in failover order.
+`limited` is true when a chat on that account hit a hard limit in the last 30 minutes. `models` lists per-model caps (`[]` when there are none). `pool` lists the chat's accounts (by slot) in failover order. `accounts`, `models`, `sessions` and `pool` are always lists, never `null`.
+
+Some fields can be missing: `alias` when the account has none; `fiveHour` and `sevenDay` when usage couldn't be read, in which case `usageError` says why; a window's `resetsAt` when no reset time is known; and a session's `sessionId` until Claude has reported it (after the first message).
 
 With `eventCommand` set, switcch runs it through `sh -c` and writes one line of JSON to its standard input:
 
