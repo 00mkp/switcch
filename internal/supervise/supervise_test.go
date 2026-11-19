@@ -251,6 +251,7 @@ type fake struct {
 	claudeArgs              []string
 	mode                    string
 	root                    string // RuntimeDir ("" = a fresh temp dir)
+	noModelFallback         bool
 }
 
 // fakeSeams points the supervisor at the fake claude; returns the log path.
@@ -295,6 +296,9 @@ func runFakeErr(t *testing.T, f fake) ([]launchRec, string, error) {
 	cfg := config.Defaults()
 	if f.mode != "" {
 		cfg.Mode = f.mode
+	}
+	if f.noModelFallback {
+		cfg.ModelFallback = nil
 	}
 	// A deadline turns a relaunch loop into a failure instead of a hung test.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -914,5 +918,33 @@ func TestWaitForResetOffByDefault(t *testing.T) {
 	l, _, notes, _ := scripted(t, proactive(), []account.Account{work, personal}, nil, []step{{10 * time.Millisecond, hardLimit}})
 	if len(l) != 1 || len(notes) != 0 {
 		t.Fatalf("default: no wait, no notification; got %d launches, notes %q", len(l), notes)
+	}
+}
+
+func TestModelCapNeverMarksAccountForOtherChats(t *testing.T) {
+	// With model fallback off, and in advisory mode, a model cap must still
+	// not push other chats (maybe on another model) off the account.
+	root := t.TempDir()
+	l, _, err := runFakeErr(t, fake{act: "ratelimit-model", noModelFallback: true, pool: []account.Account{work, personal}, root: root})
+	if err != nil || len(l) != 2 || l[1].ConfigDir != "/profiles/personal" {
+		t.Fatalf("fallback off: a model cap rotates this chat: err=%v %+v", err, l)
+	}
+	if _, err := os.Stat(limitedMarker(root, work)); err == nil {
+		t.Fatal("fallback off: a model cap must not mark work limited")
+	}
+	root = t.TempDir()
+	if l, _, err = runFakeErr(t, fake{act: "ratelimit-model", mode: "advisory", pool: []account.Account{work, personal}, root: root}); err != nil || len(l) != 1 {
+		t.Fatalf("advisory never moves: err=%v %d", err, len(l))
+	}
+	if _, err := os.Stat(limitedMarker(root, work)); err == nil {
+		t.Fatal("advisory: a model cap must not mark work limited")
+	}
+}
+
+func TestModelCapsEverywhereDoNotPingPong(t *testing.T) {
+	// Every account's model is capped and fallback is off: one move, then stay.
+	l, _, err := runFakeErr(t, fake{act: "ratelimit-model-always", noModelFallback: true, pool: []account.Account{work, personal}})
+	if err != nil || len(l) != 2 {
+		t.Fatalf("want exactly one move then stay: err=%v launches=%d", err, len(l))
 	}
 }

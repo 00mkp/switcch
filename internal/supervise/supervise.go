@@ -276,6 +276,7 @@ type chat struct {
 	// user's own) and the models already capped or tried there.
 	model       string
 	triedModels map[string]bool
+	capped      map[int]time.Time // accounts where this chat ran out of models (chat-local)
 
 	// Wait-for-reset (per Claude process): resume on waitFor at waitUntil
 	// unless the user sends a message after waitSince.
@@ -345,6 +346,9 @@ func (c *chat) skipWait(a account.Account) bool  { return c.failed[a.Slot] }
 func (c *chat) isLimited(a account.Account) bool { return limitedRecently(c.mroot, a) }
 
 func (c *chat) skip(a account.Account) bool {
+	if t, ok := c.capped[a.Slot]; ok && time.Since(t) < limitedTTL {
+		return true
+	}
 	return c.failed[a.Slot] || limitedRecently(c.mroot, a)
 }
 
@@ -441,7 +445,14 @@ func (c *chat) tick() *move {
 				}
 			}
 		}
-		markLimited(c.mroot, c.active)
+		if s.Model != "" {
+			// Only one model is capped: other chats on this account (maybe on
+			// another model) stay put, so no shared marker — but this chat
+			// won't come back here for a while (no ping-pong).
+			c.capped[c.active.Slot] = time.Now()
+		} else {
+			markLimited(c.mroot, c.active)
+		}
 		c.emit(event.LimitHit, c.active)
 		tgt := c.next(100)
 		if decide(hookEvent{kind: hooks.RateLimited, hasTarget: tgt != nil, mode: cfg.Mode}) == switchAcct {
@@ -600,7 +611,7 @@ func Run(ctx context.Context, o Options) error {
 	defer signal.Stop(term)
 
 	c := &chat{o: o, sigDir: sigDir, mroot: markerRoot(root), claude: claude, active: o.Pool[0],
-		sid: resumeID(o.ClaudeArgs), failed: map[int]bool{}, triedModels: map[string]bool{}, started: time.Now()}
+		sid: resumeID(o.ClaudeArgs), failed: map[int]bool{}, triedModels: map[string]bool{}, capped: map[int]time.Time{}, started: time.Now()}
 	c.cwd, _ = os.Getwd()
 	_, env, err := prepare(c.active)
 	if err != nil {
