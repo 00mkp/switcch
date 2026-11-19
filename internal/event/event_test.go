@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -39,4 +42,31 @@ func TestEventCommandNeverBlocks(t *testing.T) {
 	if d := time.Since(start); d > 50*time.Millisecond {
 		t.Fatalf("Emit blocked for %v", d)
 	}
+}
+
+func TestTimeoutKillsTheWholeCommand(t *testing.T) {
+	o := Timeout
+	t.Cleanup(func() { Timeout = o })
+	Timeout = 200 * time.Millisecond
+	pidFile := filepath.Join(t.TempDir(), "pid")
+	// A compound command whose child would outlive a kill of sh alone.
+	Emit("sleep 30 & echo $! > '"+pidFile+"'; wait", Event{Reason: LimitHit})
+	var pid int
+	for i := 0; i < 100 && pid == 0; i++ {
+		time.Sleep(10 * time.Millisecond)
+		b, _ := os.ReadFile(pidFile)
+		pid, _ = strconv.Atoi(strings.TrimSpace(string(b)))
+	}
+	if pid == 0 {
+		t.Fatal("command never started")
+	}
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if syscall.Kill(pid, 0) != nil {
+			return // gone
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("pid %d from the event command outlived the timeout", pid)
 }

@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"os/exec"
+	"syscall"
 	"time"
 )
 
@@ -47,6 +48,11 @@ func Emit(command string, e Event) {
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
 		cmd.Stdin = bytes.NewReader(append(b, '\n'))
+		// Own process group, killed as a whole on timeout: a compound command's
+		// children must not outlive it.
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+		cmd.WaitDelay = time.Second
 		_ = cmd.Run() // stdout/stderr nil = discarded (never onto Claude's screen)
 	}()
 }
