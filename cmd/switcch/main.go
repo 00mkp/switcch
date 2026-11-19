@@ -53,7 +53,7 @@ func statusJSON(accts []account.Account, sessions []session.Session, usageOf fun
 		Limited    bool       `json:"limited"`
 		FiveHour   *jWindow   `json:"fiveHour,omitempty"`
 		SevenDay   *jWindow   `json:"sevenDay,omitempty"`
-		Models     []jModel   `json:"models,omitempty"`
+		Models     []jModel   `json:"models"`
 		UsageError string     `json:"usageError,omitempty"`
 		Sessions   []jSession `json:"sessions"`
 	}
@@ -70,7 +70,7 @@ func statusJSON(accts []account.Account, sessions []session.Session, usageOf fun
 		Accounts []jAccount `json:"accounts"`
 	}{Schema: 1, Accounts: []jAccount{}}
 	for _, a := range accts {
-		ja := jAccount{Slot: a.Slot, Email: a.Email, Alias: a.Alias, Limited: limited(a), Sessions: []jSession{}}
+		ja := jAccount{Slot: a.Slot, Email: a.Email, Alias: a.Alias, Limited: limited(a), Models: []jModel{}, Sessions: []jSession{}}
 		if u, err := usageOf(a); err == nil {
 			ja.FiveHour = win(u.FiveHour)
 			ja.SevenDay = win(u.SevenDay)

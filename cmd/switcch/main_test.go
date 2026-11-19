@@ -344,6 +344,9 @@ func TestStatusJSONSchema(t *testing.T) {
 	if a0["limited"] != true || a1["limited"] != false {
 		t.Fatalf("limited flags: %v %v", a0["limited"], a1["limited"])
 	}
+	if ms, ok := a0["models"].([]any); !ok || len(ms) != 0 {
+		t.Fatalf("models must be [] when usage has no model caps, got %#v", a0["models"])
+	}
 	if s, ok := a0["sessions"].([]any); !ok || len(s) != 0 {
 		t.Fatalf("an account with no sessions must have sessions: [], got %#v", a0["sessions"])
 	}
