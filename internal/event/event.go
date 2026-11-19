@@ -43,8 +43,9 @@ func Emit(command string, e Event) {
 	if err != nil {
 		return
 	}
+	timeout := Timeout // read once, before the goroutine
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), Timeout)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
 		cmd.Stdin = bytes.NewReader(append(b, '\n'))
