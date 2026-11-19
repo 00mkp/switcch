@@ -61,23 +61,6 @@ func Record(s Session) error {
 	return save(out)
 }
 
-// Update applies fn to the recorded session with this pid (no-op if absent).
-func Update(pid int, fn func(*Session)) error {
-	unlock, err := lock()
-	if err != nil {
-		return err
-	}
-	defer unlock()
-	list := load()
-	for i := range list {
-		if list[i].PID == pid {
-			fn(&list[i])
-			return save(list)
-		}
-	}
-	return nil
-}
-
 // List returns the live sessions, pruning dead ones from the registry file.
 func List() ([]Session, error) {
 	unlock, err := lock()

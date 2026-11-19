@@ -330,6 +330,15 @@ func (c *chat) emit(reason string, a account.Account) {
 	emitEvent(c.o.Config.EventCommand, event.Event{SessionID: c.sid, Account: a.Email, Reason: reason, Timestamp: time.Now()})
 }
 
+// resetLabel shows a reset time: "15:04" today, else with the date.
+func resetLabel(at, now time.Time) string {
+	at, now = at.Local(), now.Local()
+	if at.Format("2006-01-02") == now.Format("2006-01-02") {
+		return at.Format("15:04")
+	}
+	return at.Format("Mon Jan 2 15:04")
+}
+
 // startWait schedules a resume at the pool's earliest reset (spec §5.6, opt-in).
 func (c *chat) startWait() {
 	a, at, ok := earliestReset(c.o.Pool, usageOf, clock(), c.skipWait, c.isLimited)
@@ -339,7 +348,7 @@ func (c *chat) startWait() {
 	}
 	// A short grace absorbs clock skew between this Mac and the server.
 	c.waitFor, c.waitUntil, c.waitSince = a, at.Add(resetGrace), time.Now()
-	notify("switcch", fmt.Sprintf("All accounts for this chat are at their limit — continuing on %s at %s.", name(a), at.Local().Format("15:04")))
+	notify("switcch", fmt.Sprintf("All accounts for this chat are at their limit — continuing on %s at %s.", name(a), resetLabel(at, time.Now())))
 }
 
 func (c *chat) skipWait(a account.Account) bool  { return c.failed[a.Slot] }

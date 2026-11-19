@@ -948,3 +948,13 @@ func TestModelCapsEverywhereDoNotPingPong(t *testing.T) {
 		t.Fatalf("want exactly one move then stay: err=%v launches=%d", err, len(l))
 	}
 }
+
+func TestResetLabel(t *testing.T) {
+	now := time.Date(2026, 11, 18, 10, 0, 0, 0, time.Local)
+	if got := resetLabel(now.Add(3*time.Hour), now); got != "13:00" {
+		t.Fatalf("same day: %q", got)
+	}
+	if got := resetLabel(now.Add(72*time.Hour), now); got != "Sat Nov 21 10:00" {
+		t.Fatalf("another day must show the date: %q", got)
+	}
+}
